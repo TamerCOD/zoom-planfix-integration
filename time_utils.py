@@ -13,25 +13,56 @@ logger = logging.getLogger(__name__)
 # или как строку "YYYY-MM-DD" для date-полей
 
 
-def planfix_ts_to_datetime(ts: Union[int, float, str, None]) -> Optional[datetime]:
+def planfix_ts_to_datetime(ts: Union[int, float, str, dict, None]) -> Optional[datetime]:
     """
     Преобразовать значение даты/времени из PlanFix в datetime.
-    PlanFix использует Unix timestamp для полей datetime.
+
+    Поддерживает форматы PlanFix:
+      - dict: {"date": "16-01-2025", "time": "07:10", "datetime": "2025-01-16T07:10Z",
+               "dateTimeUtcSeconds": "2025-01-16T07:10:00+0000"}
+      - Unix timestamp (int/float)
+      - ISO 8601 строки: "2025-01-16T07:10Z", "2025-01-16T07:10:00+0000"
+      - Простая дата: "YYYY-MM-DD" или "DD-MM-YYYY"
     """
     if ts is None:
         return None
+
+    # Если пришёл dict от PlanFix API — берём лучший вариант
+    if isinstance(ts, dict):
+        ts = ts.get("dateTimeUtcSeconds") or ts.get("datetime") or ts.get("date")
+        if ts is None:
+            return None
+
     try:
         if isinstance(ts, (int, float)):
             return datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.UTC)
-        # Строка ISO или просто дата
+
         s = str(ts).strip()
+
+        # ISO с временем
         if "T" in s:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            # Заменяем формат "+0000" → "+00:00" для совместимости
+            normalized = s.replace("Z", "+00:00")
+            # Если timezone в формате "+0000" без двоеточия
+            if len(normalized) >= 5 and normalized[-5] in "+-" and ":" not in normalized[-5:]:
+                normalized = normalized[:-2] + ":" + normalized[-2:]
+            try:
+                dt = datetime.fromisoformat(normalized)
+            except Exception:
+                # Пробуем без миллисекунд
+                dt = datetime.strptime(s.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
             if dt.tzinfo is None:
                 dt = pytz.UTC.localize(dt)
             return dt
-        # Только дата "YYYY-MM-DD" — используем полночь UTC
-        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=pytz.UTC)
+
+        # Только дата
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=pytz.UTC)
+            except ValueError:
+                continue
+
+        return None
     except Exception as e:
         logger.warning(f"Не удалось разобрать дату PlanFix '{ts}': {e}")
         return None

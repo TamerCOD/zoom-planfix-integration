@@ -139,8 +139,13 @@ class ZoomPoller:
         self.zoom = zoom
         self.cfg = cfg
         self.poll_interval = poll_interval
-        self._processed_in_run = set()  # чтобы не обрабатывать одну задачу дважды за итерацию
-        self._last_modified_check = int(time.time()) - 3600  # с прошлого часа
+        self._processed_in_run = set()
+        self._last_modified_check = int(time.time())
+        # Кеш состояния обработанных задач: {task_id: hash_of_relevant_fields}
+        self._task_state_cache: dict = {}
+        # Максимальный ID последней просканированной задачи
+        self._max_known_id = 0
+        self._initialized = False
         self._stop = False
 
     def stop(self):
@@ -162,16 +167,19 @@ class ZoomPoller:
     async def tick(self):
         """Одна итерация поллинга"""
         self._processed_in_run.clear()
-        now = int(time.time())
 
-        # Получаем задачи, изменённые с прошлой проверки (с запасом 5 мин)
-        since = self._last_modified_check - 300
-        tasks = self._fetch_recent_tasks(since)
-
-        if not tasks:
-            self._last_modified_check = now
+        if not self._initialized:
+            await self._initial_scan()
+            self._initialized = True
             return
 
+        # Сканируем хвост списка задач (там самые новые)
+        tasks = self._fetch_tail_tasks(scan_pages=3)
+
+        if not tasks:
+            return
+
+        # Обрабатываем все Zoom-задачи (новые ИЛИ изменённые)
         zoom_tasks = [
             t for t in tasks if is_zoom_task(
                 t,
@@ -180,9 +188,21 @@ class ZoomPoller:
             )
         ]
 
-        logger.info(f"Tick: {len(tasks)} изменённых задач, {len(zoom_tasks)} Zoom-задач")
+        new_zoom_tasks = []
+        for t in zoom_tasks:
+            tid = t["id"]
+            state_hash = self._compute_state_hash(t)
+            if self._task_state_cache.get(tid) != state_hash:
+                new_zoom_tasks.append(t)
+                self._task_state_cache[tid] = state_hash
 
-        for task in zoom_tasks:
+        if new_zoom_tasks:
+            logger.info(
+                f"Tick: {len(tasks)} задач в хвосте, {len(zoom_tasks)} Zoom-задач, "
+                f"{len(new_zoom_tasks)} требуют обработки"
+            )
+
+        for task in new_zoom_tasks:
             if task["id"] in self._processed_in_run:
                 continue
             try:
@@ -191,24 +211,113 @@ class ZoomPoller:
                 logger.exception(f"Ошибка обработки задачи {task.get('id')}: {e}")
             self._processed_in_run.add(task["id"])
 
-        self._last_modified_check = now
+    async def _initial_scan(self):
+        """
+        Первичное сканирование при старте — кэшируем состояние существующих задач,
+        чтобы не обрабатывать их повторно. Идём от последней страницы к началу.
+        """
+        logger.info("🔍 Первичное сканирование задач...")
+        offset = 0
+        total = 0
 
-    def _fetch_recent_tasks(self, since_ts: int) -> list:
-        """Получить задачи, изменённые с момента since_ts"""
-        try:
+        # Сначала найдём общее количество (через быстрый скан)
+        for page in range(50):  # макс 5000 задач
             res = self.pf.post("/task/list", {
+                "offset": offset,
+                "pageSize": 100,
+                "fields": "id,name",
+            })
+            tasks = res.get("tasks", [])
+            if not tasks:
+                break
+            total += len(tasks)
+            for t in tasks:
+                tid = t["id"]
+                if tid > self._max_known_id:
+                    self._max_known_id = tid
+                # Не вычисляем state hash — пропускаем существующие при старте
+                # (только новые, появившиеся после старта, будут обработаны)
+                self._task_state_cache[tid] = "_initial_"
+            if len(tasks) < 100:
+                break
+            offset += 100
+
+        logger.info(
+            f"🔍 Просканировано {total} задач, max_id={self._max_known_id}. "
+            f"Поллинг готов к работе."
+        )
+
+    def _fetch_tail_tasks(self, scan_pages: int = 3) -> list:
+        """
+        Получить задачи с хвоста списка (там новейшие).
+        scan_pages — сколько последних страниц по 100 сканировать.
+        """
+        try:
+            # Сначала найдём общий размер списка через первую страницу
+            first = self.pf.post("/task/list", {
                 "offset": 0,
                 "pageSize": 100,
-                "fields": "id,name,description,status,template,project,assignees,owner,priority,dateBegin,dateEnd,startDateTime,endDateTime",
-                "filters": [
-                    {"type": 4, "operator": "greaterOrEqual", "value": since_ts}
-                ],
-                "sort": [{"field": "dateChanged", "order": "desc"}],
+                "fields": "id",
             })
-            return res.get("tasks", [])
+            # Total может быть в разных местах
+            total_count = first.get("total") or first.get("count")
+
+            # Если total неизвестен — пробежимся пагинацией от 0
+            if not total_count:
+                # Соберём все
+                offset = 0
+                all_tasks = []
+                for _ in range(50):
+                    r = self.pf.post("/task/list", {
+                        "offset": offset,
+                        "pageSize": 100,
+                        "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime",
+                    })
+                    items = r.get("tasks", [])
+                    if not items:
+                        break
+                    all_tasks.extend(items)
+                    if len(items) < 100:
+                        break
+                    offset += 100
+                # Возвращаем последние scan_pages * 100
+                tail_size = scan_pages * 100
+                return all_tasks[-tail_size:] if all_tasks else []
+
+            # Иначе берём ровно последние страницы
+            results = []
+            start_offset = max(0, total_count - scan_pages * 100)
+            for page in range(scan_pages + 1):
+                offset = start_offset + page * 100
+                r = self.pf.post("/task/list", {
+                    "offset": offset,
+                    "pageSize": 100,
+                    "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime",
+                })
+                items = r.get("tasks", [])
+                if not items:
+                    break
+                results.extend(items)
+                if len(items) < 100:
+                    break
+            return results
         except Exception as e:
-            logger.error(f"Не удалось получить задачи: {e}")
+            logger.error(f"Не удалось получить хвост задач: {e}")
             return []
+
+    @staticmethod
+    def _compute_state_hash(task: dict) -> str:
+        """Хэш ключевых полей для определения изменений"""
+        import hashlib
+        key = json.dumps({
+            "name": task.get("name"),
+            "description": task.get("description") or "",
+            "status_id": (task.get("status") or {}).get("id"),
+            "start": task.get("startDateTime"),
+            "end": task.get("endDateTime"),
+            "assignees": task.get("assignees"),
+        }, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(key.encode()).hexdigest()
 
     async def _process_task(self, task_summary: dict):
         """Обработать одну Zoom-задачу"""
@@ -249,11 +358,11 @@ class ZoomPoller:
         name = task.get("name", f"Конференция #{task_id}")
         topic = self._extract_topic(name)
 
-        date_begin = task.get("dateBegin") or task.get("startDateTime")
-        date_end = task.get("dateEnd") or task.get("endDateTime")
+        date_begin = self._extract_datetime(task.get("startDateTime") or task.get("dateBegin"))
+        date_end = self._extract_datetime(task.get("endDateTime") or task.get("dateEnd"))
 
         if not date_begin:
-            logger.info(f"Task {task_id}: нет dateBegin — пропускаю")
+            logger.info(f"Task {task_id}: нет startDateTime — пропускаю")
             try:
                 self.pf.add_comment(
                     task_id,
@@ -339,7 +448,7 @@ class ZoomPoller:
         """Проверить, изменились ли тема/время и обновить Zoom-встречу при необходимости"""
         task_id = task["id"]
         new_topic = self._extract_topic(task.get("name", ""))
-        date_begin = task.get("dateBegin") or task.get("startDateTime")
+        date_begin = self._extract_datetime(task.get("startDateTime") or task.get("dateBegin"))
 
         if not date_begin:
             return
@@ -347,7 +456,7 @@ class ZoomPoller:
         new_start = to_zoom_iso(date_begin, self.cfg.zoom_timezone)
         new_duration = calc_duration_minutes(
             date_begin,
-            task.get("dateEnd") or task.get("endDateTime"),
+            self._extract_datetime(task.get("endDateTime") or task.get("dateEnd")),
             self.cfg.zoom_default_duration_min,
         )
 
@@ -473,3 +582,25 @@ class ZoomPoller:
         for pat in ZOOM_TRIGGERS + CANCEL_MARKERS:
             cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
         return cleaned.strip(" :-—") or name
+
+    @staticmethod
+    def _extract_datetime(dt_value):
+        """
+        Извлечь дату/время из объекта PlanFix API.
+
+        PlanFix возвращает datetime в формате:
+          {"date": "16-01-2025", "time": "07:10", "datetime": "2025-01-16T07:10Z",
+           "dateTimeUtcSeconds": "2025-01-16T07:10:00+0000"}
+
+        Также поддерживает простые строки и Unix timestamps.
+        """
+        if not dt_value:
+            return None
+        if isinstance(dt_value, dict):
+            # Предпочитаем dateTimeUtcSeconds, потом datetime
+            return (
+                dt_value.get("dateTimeUtcSeconds")
+                or dt_value.get("datetime")
+                or dt_value.get("date")
+            )
+        return dt_value
