@@ -29,6 +29,7 @@ from typing import Optional, Tuple
 from planfix_client import PlanfixClient, PlanfixAPIError
 from zoom_client import ZoomClient, ZoomAPIError
 from telegram_client import TelegramClient
+from reminder import ReminderManager
 from time_utils import to_zoom_iso, calc_duration_minutes, format_meeting_time
 
 logger = logging.getLogger(__name__)
@@ -217,6 +218,8 @@ class ZoomPoller:
         self._max_known_id = 0
         self._initialized = False
         self._stop = False
+        # Менеджер напоминаний
+        self.reminders = ReminderManager(pf, tg, cfg)
 
     def stop(self):
         self._stop = True
@@ -274,6 +277,16 @@ class ZoomPoller:
             f"{len(new_zoom_tasks)} требуют обработки "
             f"(template_id={self.cfg.planfix_zoom_template_id})"
         )
+
+        # ─── Проверяем напоминания для всех Zoom-задач (даже если ничего нового) ──
+        try:
+            await self.reminders.check_reminders(
+                zoom_tasks,
+                extract_meta_fn=extract_meta,
+                inject_meta_fn=inject_meta,
+            )
+        except Exception as e:
+            logger.exception(f"Ошибка в reminder check: {e}")
 
         for task in new_zoom_tasks:
             if task["id"] in self._processed_in_run:
