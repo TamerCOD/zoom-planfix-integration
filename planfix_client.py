@@ -193,8 +193,15 @@ class PlanfixClient:
         return self.get("/field/list").get("fields", [])
 
     def get_templates(self) -> list:
-        """Получить все шаблоны задач (для настройки)"""
+        """Получить все шаблоны задач (для настройки) — старый endpoint"""
         return self.post("/task/template/list", {}).get("templates", [])
+
+    def get_objects(self, page_size: int = 100) -> list:
+        """
+        Получить все объекты-шаблоны PlanFix (это те, что в UI «Объекты» при создании задачи).
+        В админке доступны: /account/processes
+        """
+        return self.post("/object/list", {"offset": 0, "pageSize": page_size}).get("objects", [])
 
     def get_employees(self) -> list:
         """Получить список сотрудников"""

@@ -150,6 +150,75 @@ async def poll_now():
         return {"status": "error", "message": str(e)}
 
 
+@app.get("/dashboard")
+async def dashboard():
+    """
+    Список всех активных Zoom-конференций (тех, что управляются интегрцией).
+    Сканирует кэш поллера + проверяет Zoom API.
+    """
+    from poller import is_zoom_task, extract_meta
+
+    # Получаем хвост задач
+    tasks = poller._fetch_tail_tasks(scan_pages=5)
+    zoom_tasks_with_meta = []
+    cancelled = []
+
+    for t in tasks:
+        if not is_zoom_task(
+            t,
+            zoom_status_id=cfg.status_active,
+            zoom_project_id=cfg.planfix_zoom_project_id,
+            zoom_template_id=cfg.planfix_zoom_template_id,
+        ):
+            continue
+        meta = extract_meta(t.get("description") or "")
+        if not meta or not meta.get("meeting_id"):
+            continue
+        item = {
+            "task_id": t.get("id"),
+            "task_url": f"https://{cfg.planfix_account}.planfix.com/task/{t.get('id')}",
+            "topic": meta.get("topic"),
+            "meeting_id": meta.get("meeting_id"),
+            "join_url": meta.get("join_url"),
+            "start_time": meta.get("start_time"),
+            "duration": meta.get("duration"),
+            "initiator": meta.get("initiator_name"),
+            "cancelled": meta.get("cancelled", False),
+        }
+        if meta.get("cancelled"):
+            cancelled.append(item)
+        else:
+            zoom_tasks_with_meta.append(item)
+
+    return {
+        "total_active": len(zoom_tasks_with_meta),
+        "total_cancelled": len(cancelled),
+        "active": zoom_tasks_with_meta,
+        "cancelled": cancelled,
+        "info": {
+            "service": "PlanFix-Zoom integration",
+            "telegram_chat": cfg.telegram_chat_id,
+            "planfix_account": cfg.planfix_account,
+        },
+    }
+
+
+@app.get("/process/{task_id}")
+async def process_task(task_id: int):
+    """Принудительно обработать конкретную задачу (без ожидания poll)"""
+    try:
+        task = pf.get(
+            f"/task/{task_id}",
+            params={"fields": "id,name,description,status,owner,assignees,startDateTime,endDateTime"},
+        )
+        full_task = task.get("task", task)
+        await poller._process_task(full_task)
+        return {"status": "ok", "task_id": task_id}
+    except Exception as e:
+        logger.exception(f"Manual process failed for {task_id}")
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/webhook/planfix")
 async def planfix_webhook(request: Request):
     """

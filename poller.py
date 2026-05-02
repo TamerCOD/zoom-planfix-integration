@@ -24,7 +24,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 from planfix_client import PlanfixClient, PlanfixAPIError
 from zoom_client import ZoomClient, ZoomAPIError
@@ -54,18 +54,48 @@ CANCEL_MARKERS = [
     r"#отмена\b",
 ]
 
-META_BEGIN = "<!-- ZOOM_META:"
-META_END = "-->"
-META_PATTERN = re.compile(r"<!--\s*ZOOM_META:\s*(\{[^}]+\})\s*-->", re.DOTALL)
+# Маркеры в комментариях — только они дают авторизованную отмену
+CANCEL_COMMENT_MARKERS = [
+    r"^\s*/cancel\b",
+    r"^\s*/отмена\b",
+    r"^\s*\[ОТМЕНА\]",
+    r"^\s*\[ОТМЕНЕНА\]",
+    r"^\s*ОТМЕНА\s*$",
+    r"^\s*ОТМЕНИТЬ\s*$",
+]
+
+META_BEGIN = "[ZOOM_META_v1]"
+META_END = "[/ZOOM_META_v1]"
+META_PATTERN = re.compile(r"\[ZOOM_META_v1\]([^\[]+)\[/ZOOM_META_v1\]", re.DOTALL)
 RSVP_MARKER = "[RSVP]"
 
 
-def is_zoom_task(task: dict, zoom_status_id: int = 0, zoom_project_id: int = 0) -> bool:
-    """Проверка, является ли задача Zoom-конференцией"""
+def is_zoom_task(
+    task: dict,
+    zoom_status_id: int = 0,
+    zoom_project_id: int = 0,
+    zoom_template_id: int = 0,
+) -> bool:
+    """
+    Проверка, является ли задача Zoom-конференцией.
+    Сработает любое из условий:
+      - Имя задачи содержит маркер ZOOM: / [ZOOM] / #zoom / Конференция Zoom
+      - Шаблон/объект задачи = zoom_template_id
+      - Статус задачи = zoom_status_id
+      - Проект = zoom_project_id
+    """
     name = task.get("name", "") or ""
     for pat in ZOOM_TRIGGERS:
         if re.search(pat, name, re.IGNORECASE):
             return True
+
+    # Объект (шаблон) задачи в PlanFix v2
+    if zoom_template_id:
+        template = task.get("template") or task.get("object")
+        if isinstance(template, dict):
+            tid = template.get("id")
+            if tid and int(tid) == zoom_template_id:
+                return True
 
     if zoom_status_id:
         sid = task.get("status", {}).get("id")
@@ -81,7 +111,7 @@ def is_zoom_task(task: dict, zoom_status_id: int = 0, zoom_project_id: int = 0) 
 
 
 def is_cancellation_signal(task: dict) -> bool:
-    """Проверка признаков отмены конференции"""
+    """Проверка признаков отмены конференции в названии/описании"""
     name = task.get("name", "") or ""
     desc = task.get("description", "") or ""
     text = f"{name}\n{desc}"
@@ -91,28 +121,65 @@ def is_cancellation_signal(task: dict) -> bool:
     return False
 
 
+def is_authorized_cancel_comment(comment_text: str) -> bool:
+    """Является ли текст комментария командой отмены"""
+    if not comment_text:
+        return False
+    for pat in CANCEL_COMMENT_MARKERS:
+        if re.search(pat, comment_text, re.IGNORECASE | re.MULTILINE):
+            return True
+    return False
+
+
+def parse_user_id(owner: dict) -> Optional[int]:
+    """
+    PlanFix возвращает ID в разных форматах: 12 или "user:12".
+    Извлекает числовой ID.
+    """
+    if not owner:
+        return None
+    raw = owner.get("id")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        # "user:12" -> 12
+        if ":" in raw:
+            try:
+                return int(raw.split(":")[-1])
+            except ValueError:
+                return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
+
+
 def extract_meta(description: str) -> Optional[dict]:
-    """Извлечь скрытый JSON-маркер из описания задачи"""
+    """Извлечь base64-закодированный JSON-маркер из описания задачи"""
     if not description or META_BEGIN not in description:
         return None
     m = META_PATTERN.search(description)
     if m:
+        import base64
         try:
-            return json.loads(m.group(1))
+            data = m.group(1).strip()
+            decoded = base64.b64decode(data).decode("utf-8")
+            return json.loads(decoded)
         except Exception as e:
             logger.warning(f"Не удалось распарсить ZOOM_META: {e}")
     return None
 
 
 def inject_meta(description: str, meta: dict) -> str:
-    """Записать/обновить скрытый маркер в описании"""
+    """Записать/обновить маркер в описании (base64 для компактности)"""
+    import base64
     meta_str = json.dumps(meta, ensure_ascii=False)
-    new_marker = f"{META_BEGIN} {meta_str} {META_END}"
+    encoded = base64.b64encode(meta_str.encode("utf-8")).decode("ascii")
+    new_marker = f"{META_BEGIN}{encoded}{META_END}"
 
     if META_BEGIN in (description or ""):
-        # Заменяем существующий
         return META_PATTERN.sub(new_marker, description)
-    # Добавляем в конец
     if description:
         return f"{description}\n\n{new_marker}"
     return new_marker
@@ -188,6 +255,7 @@ class ZoomPoller:
                 t,
                 zoom_status_id=self.cfg.status_active,
                 zoom_project_id=self.cfg.planfix_zoom_project_id,
+                zoom_template_id=self.cfg.planfix_zoom_template_id,
             )
         ]
 
@@ -326,24 +394,47 @@ class ZoomPoller:
         """Обработать одну Zoom-задачу"""
         task_id = task_summary["id"]
 
-        # Получаем полные данные задачи
+        # Получаем полные данные задачи (с владельцем и описанием)
         try:
-            full = self.pf.get_task(task_id)
+            full = self.pf.get(
+                f"/task/{task_id}",
+                params={"fields": "id,name,description,status,owner,assignees,startDateTime,endDateTime,project"},
+            )
+            full_task = full.get("task", full)
         except Exception as e:
             logger.error(f"Не удалось получить задачу {task_id}: {e}")
             return
 
         # PlanFix может вернуть минимальный объект — мерджим
-        task = {**task_summary, **(full or {})}
+        task = {**task_summary, **(full_task or {})}
         if not task.get("name"):
             return  # пропускаем пустые
 
         meta = extract_meta(task.get("description") or "")
 
-        # ─── Признак отмены ───────────────────────────────────────────────────
+        # ─── Авторизованная отмена через комментарий /cancel ────────────────
+        if meta and meta.get("meeting_id"):
+            cancel_result = await self._check_authorized_cancel(task, meta)
+            if cancel_result == "authorized":
+                await self._cancel_meeting(task, meta)
+                return
+            elif cancel_result == "unauthorized":
+                # Уже отправлено уведомление в _check_authorized_cancel
+                return
+
+        # ─── Признак отмены через имя задачи (доп. проверка на инициатора) ──
         if is_cancellation_signal(task):
             if meta and meta.get("meeting_id"):
-                await self._cancel_meeting(task, meta)
+                # Проверяем, что инициатор в task.owner
+                current_owner_id = parse_user_id(task.get("owner") or {})
+                meta_initiator_id = meta.get("initiator_id")
+                if meta_initiator_id and current_owner_id == parse_user_id({"id": meta_initiator_id}):
+                    await self._cancel_meeting(task, meta)
+                else:
+                    # Возвращаем имя — отмена через имя ненадёжна
+                    logger.warning(
+                        f"Task {task_id}: отмена через имя — инициатор не подтверждён, игнорируем"
+                    )
             return
 
         # ─── Уже создана — проверяем, надо ли обновить ────────────────────────
@@ -354,6 +445,89 @@ class ZoomPoller:
 
         # ─── Новая Zoom-задача — создаём встречу ──────────────────────────────
         await self._create_meeting_for_task(task)
+
+    async def _check_authorized_cancel(self, task: dict, meta: dict) -> str:
+        """
+        Проверить, есть ли в свежих комментариях команда отмены от инициатора.
+
+        Returns:
+            "authorized"   — инициатор оставил команду /cancel
+            "unauthorized" — кто-то другой пытался отменить (отправляем warning)
+            "none"         — команд отмены нет
+        """
+        task_id = task["id"]
+        meta_initiator_id = meta.get("initiator_id")
+        if not meta_initiator_id:
+            return "none"
+
+        # Получаем последние 20 комментариев
+        try:
+            res = self.pf.post(
+                f"/task/{task_id}/comments/list",
+                {"offset": 0, "pageSize": 20, "fields": "id,description,owner,dateTime"},
+            )
+            comments = res.get("comments", [])
+        except Exception as e:
+            logger.warning(f"Не удалось получить комментарии {task_id}: {e}")
+            return "none"
+
+        # Время создания meta — учитываем только комментарии после создания встречи
+        meta_created_at = meta.get("created_at", "")
+
+        for c in comments:
+            text = (c.get("description") or "").strip()
+            # Убираем HTML теги — PlanFix может их добавлять
+            clean_text = re.sub(r"<[^>]+>", "", text)
+            if not is_authorized_cancel_comment(clean_text):
+                continue
+
+            comment_owner_id = parse_user_id(c.get("owner") or {})
+            comment_dt = (c.get("dateTime") or {}).get("dateTimeUtcSeconds", "")
+
+            # Пропускаем старые (до создания встречи)
+            if meta_created_at and comment_dt and comment_dt < meta_created_at:
+                continue
+
+            # Проверяем, не обработан ли уже этот комментарий
+            if meta.get("cancel_comment_id") == c.get("id"):
+                # Уже отметили этот комментарий — возможно был запрет, не повторяем
+                return "none"
+
+            # Сравниваем автора комментария с инициатором
+            if comment_owner_id == parse_user_id({"id": meta_initiator_id}):
+                logger.info(f"Task {task_id}: авторизованная отмена от инициатора (comment {c.get('id')})")
+                return "authorized"
+
+            # Кто-то другой пытается отменить
+            logger.warning(
+                f"Task {task_id}: попытка отмены не-инициатором "
+                f"(comment_owner={comment_owner_id}, meta_initiator={meta_initiator_id})"
+            )
+            try:
+                self.pf.add_comment(
+                    task_id,
+                    f"⚠️ **Отмена встречи отклонена**\n\n"
+                    f"Только инициатор ({meta.get('initiator_name', '?')}) может отменить эту конференцию.",
+                )
+            except Exception:
+                pass
+            if self.tg:
+                self.tg.send_message_safe(
+                    f"⚠️ *Попытка несанкционированной отмены*\n\n"
+                    f"Тема: {meta.get('topic')}\n"
+                    f"Инициатор: {meta.get('initiator_name')}\n"
+                    f"_Только инициатор может отменить встречу._"
+                )
+            # Помечаем этот comment_id, чтобы не повторять
+            meta["cancel_comment_id"] = c.get("id")
+            new_desc = inject_meta(task.get("description") or "", meta)
+            try:
+                self.pf.update_task(task_id, {"description": new_desc})
+            except Exception:
+                pass
+            return "unauthorized"
+
+        return "none"
 
     async def _create_meeting_for_task(self, task: dict):
         """Создать Zoom-встречу для задачи + Telegram + комментарий в PlanFix"""
@@ -381,6 +555,20 @@ class ZoomPoller:
         duration = calc_duration_minutes(date_begin, date_end, self.cfg.zoom_default_duration_min)
         time_str = format_meeting_time(date_begin, self.cfg.zoom_timezone)
 
+        # Извлекаем инициатора (постановщика задачи)
+        initiator = task.get("owner") or {}
+        initiator_id = initiator.get("id") if isinstance(initiator, dict) else None
+        initiator_name = (
+            initiator.get("name")
+            if isinstance(initiator, dict)
+            else None
+        ) or "не указан"
+
+        # Список участников для отображения
+        participants = self.pf.get_task_participants(task)
+        participant_names = [p.get("name", "?") for p in participants]
+        participants_text = ", ".join(participant_names) if participant_names else "не указаны"
+
         # ── Шаг 1: уведомление в Telegram о новой задаче ──────────────────────
         if self.tg:
             self.tg.send_message_safe(
@@ -388,23 +576,32 @@ class ZoomPoller:
                 f"📌 *Тема:* {topic}\n"
                 f"🕐 *Время:* {time_str}\n"
                 f"⏱ *Длительность:* {duration} мин\n"
+                f"👤 *Инициатор:* {initiator_name}\n"
+                f"👥 *Участники:* {participants_text}\n"
                 f"🔗 [Открыть в PlanFix]({pf_url})\n\n"
                 f"_Создаю Zoom-встречу..._",
                 disable_web_page_preview=True,
             )
 
         logger.info(
-            f"Создаю Zoom-встречу для task {task_id}: '{topic}' @ {start_time} ({duration} min)"
+            f"Создаю Zoom-встречу для task {task_id}: '{topic}' @ {start_time} ({duration} min) "
+            f"by initiator={initiator_name}"
         )
 
         # ── Шаг 2: создаём встречу в Zoom ─────────────────────────────────────
+        # В agenda Zoom указываем инициатора и участников
+        agenda_text = (
+            f"Инициатор: {initiator_name}\n"
+            f"Участники: {participants_text}\n"
+            f"PlanFix задача: {pf_url}"
+        )
         try:
             meeting = self.zoom.create_meeting(
                 topic=topic,
                 start_time_iso=start_time,
                 duration_min=duration,
                 timezone=self.cfg.zoom_timezone,
-                agenda=f"PlanFix #{task_id}",
+                agenda=agenda_text,
             )
         except Exception as e:
             logger.error(f"Zoom API ошибка: {e}")
@@ -423,7 +620,7 @@ class ZoomPoller:
         password = meeting.get("password", "")
         uuid = meeting.get("uuid", "")
 
-        # Сохраняем метаданные в описании
+        # Сохраняем метаданные в описании (включая инициатора для access control)
         meta = {
             "meeting_id": meeting_id,
             "uuid": uuid,
@@ -433,6 +630,8 @@ class ZoomPoller:
             "start_time": start_time,
             "duration": duration,
             "created_at": datetime.utcnow().isoformat(),
+            "initiator_id": initiator_id,
+            "initiator_name": initiator_name,
         }
 
         new_desc = inject_meta(task.get("description") or "", meta)
@@ -446,13 +645,19 @@ class ZoomPoller:
             f"🎥 **Zoom-конференция создана автоматически**\n\n"
             f"📌 **Тема:** {topic}\n"
             f"🕐 **Время:** {time_str}\n"
-            f"⏱ **Длительность:** {duration} мин\n\n"
+            f"⏱ **Длительность:** {duration} мин\n"
+            f"👤 **Инициатор:** {initiator_name}\n"
+            f"👥 **Участники:** {participants_text}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔗 **Ссылка для подключения:**\n{join_url}\n\n"
             f"🔑 **Meeting ID:** `{meeting_id}`\n"
             f"🔐 **Пароль:** `{password}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💡 Чтобы отменить — добавьте `[ОТМЕНА]` в название задачи или `#cancel` в описание."
+            f"❗ **Отмена встречи:**\n"
+            f"Только инициатор ({initiator_name}) может отменить. Для отмены — оставьте здесь "
+            f"комментарий `/cancel` (или `[ОТМЕНА]` в любом регистре).\n\n"
+            f"📋 **RSVP:** ниже созданы подзадачи для каждого участника. "
+            f"Каждый отмечает свою — только её можно изменить (статус «В работе» = БУДУ, «Завершенная» = подтверждено)."
         )
         try:
             self.pf.add_comment(task_id, comment)
@@ -465,11 +670,14 @@ class ZoomPoller:
                 f"✅ *Zoom-встреча создана!*\n\n"
                 f"📌 *Тема:* {topic}\n"
                 f"🕐 *Время:* {time_str}\n"
-                f"⏱ *Длительность:* {duration} мин\n\n"
+                f"⏱ *Длительность:* {duration} мин\n"
+                f"👤 *Инициатор:* {initiator_name}\n"
+                f"👥 *Участники:* {participants_text}\n\n"
                 f"🔗 *Ссылка для подключения:*\n{join_url}\n\n"
                 f"🔑 *Meeting ID:* `{meeting_id}`\n"
                 f"🔐 *Пароль:* `{password}`\n\n"
-                f"📋 [Задача в PlanFix]({pf_url})",
+                f"📋 [Задача в PlanFix]({pf_url})\n\n"
+                f"_Каждому участнику создана подзадача RSVP в PlanFix._",
                 disable_web_page_preview=True,
             )
 
@@ -582,6 +790,7 @@ class ZoomPoller:
         task_id = task["id"]
         participants = self.pf.get_task_participants(task)
         if not participants:
+            logger.info(f"Task {task_id}: нет участников — RSVP не создаём")
             return
 
         try:
@@ -593,29 +802,54 @@ class ZoomPoller:
         for st in existing_subtasks:
             if RSVP_MARKER in (st.get("name") or ""):
                 for u in (st.get("assignees", {}) or {}).get("users", []):
-                    existing_users.add(u.get("id"))
+                    uid = parse_user_id(u)
+                    if uid:
+                        existing_users.add(uid)
+
+        # Получаем мета задачи для извлечения данных встречи
+        meta = extract_meta(task.get("description") or "")
+        join_url = (meta or {}).get("join_url", "")
+        meeting_id = (meta or {}).get("meeting_id", "")
+        password = (meta or {}).get("password", "")
+        topic = (meta or {}).get("topic", task.get("name", ""))
+        time_str = format_meeting_time(
+            self._extract_datetime(task.get("startDateTime")),
+            self.cfg.zoom_timezone,
+        )
 
         for p in participants:
-            uid = p.get("id")
+            uid = parse_user_id(p)
             if not uid or uid in existing_users:
                 continue
             uname = p.get("name", f"Участник {uid}")
 
+            description = (
+                f"👋 {uname}, *подтвердите участие в Zoom-конференции*\n\n"
+                f"📌 **Тема:** {topic}\n"
+                f"🕐 **Когда:** {time_str}\n"
+            )
+            if join_url:
+                description += (
+                    f"\n🔗 **Ссылка для подключения:**\n{join_url}\n"
+                    f"🔑 **Meeting ID:** `{meeting_id}`\n"
+                    f"🔐 **Пароль:** `{password}`\n"
+                )
+            description += (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"**Как ответить?** Поменяйте статус этой подзадачи:\n"
+                f"  ✅ **«В работе»** = я буду на встрече\n"
+                f"  🚫 **«Отказ»** или закройте без статуса = не буду\n\n"
+                f"_Эта подзадача назначена только вам — другие не могут её изменить._"
+            )
+
             try:
                 self.pf.create_subtask(
                     parent_task_id=task_id,
-                    name=f"{RSVP_MARKER} {uname} — подтвердите участие",
-                    description=(
-                        f"👋 {uname}, подтвердите участие в конференции.\n\n"
-                        f"Измените статус этой задачи:\n"
-                        f"  ✅ **«В работе»** = БУДУ\n"
-                        f"  ✔ **«Завершенная»** = подтверждено\n"
-                        f"  ❌ Закройте задачу с тегом #notgoing = НЕ БУДУ\n\n"
-                        f"_Только вы можете изменить эту задачу_"
-                    ),
+                    name=f"{RSVP_MARKER} {uname}: будете на встрече?",
+                    description=description,
                     assignee_id=uid,
                 )
-                logger.info(f"Создана RSVP-подзадача для {uname} в task {task_id}")
+                logger.info(f"✅ RSVP-подзадача создана для {uname} (uid={uid}) в task {task_id}")
             except Exception as e:
                 logger.warning(f"Не удалось создать RSVP для {uname}: {e}")
 
