@@ -439,10 +439,12 @@ def _clear_zoom_fields(task_id: int):
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Railway передаёт PORT через env — fallback на cfg.server_port
+    port = int(os.environ.get("PORT") or cfg.server_port)
     uvicorn.run(
         "webhook_server:app",
         host="0.0.0.0",
-        port=cfg.server_port,
+        port=port,
         reload=False,
         log_level=cfg.log_level.lower(),
     )

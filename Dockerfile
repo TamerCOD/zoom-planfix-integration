@@ -15,5 +15,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 EXPOSE 8000
 
-# Railway передаёт порт через $PORT — используем shell для подстановки
-CMD ["sh", "-c", "uvicorn webhook_server:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Запускаем через python — он сам прочитает PORT из env
+CMD ["python", "webhook_server.py"]
