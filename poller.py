@@ -247,6 +247,7 @@ class ZoomPoller:
         tasks = self._fetch_tail_tasks(scan_pages=3)
 
         if not tasks:
+            logger.info("Tick: пусто (нет задач в хвосте)")
             return
 
         # Обрабатываем все Zoom-задачи (новые ИЛИ изменённые)
@@ -267,11 +268,12 @@ class ZoomPoller:
                 new_zoom_tasks.append(t)
                 self._task_state_cache[tid] = state_hash
 
-        if new_zoom_tasks:
-            logger.info(
-                f"Tick: {len(tasks)} задач в хвосте, {len(zoom_tasks)} Zoom-задач, "
-                f"{len(new_zoom_tasks)} требуют обработки"
-            )
+        # Всегда логируем (легче дебажить)
+        logger.info(
+            f"Tick: {len(tasks)} задач в хвосте, {len(zoom_tasks)} Zoom-задач, "
+            f"{len(new_zoom_tasks)} требуют обработки "
+            f"(template_id={self.cfg.planfix_zoom_template_id})"
+        )
 
         for task in new_zoom_tasks:
             if task["id"] in self._processed_in_run:
@@ -342,7 +344,7 @@ class ZoomPoller:
                     r = self.pf.post("/task/list", {
                         "offset": offset,
                         "pageSize": 100,
-                        "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime",
+                        "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime,object,template",
                     })
                     items = r.get("tasks", [])
                     if not items:
@@ -363,7 +365,7 @@ class ZoomPoller:
                 r = self.pf.post("/task/list", {
                     "offset": offset,
                     "pageSize": 100,
-                    "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime",
+                    "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime,object,template",
                 })
                 items = r.get("tasks", [])
                 if not items:
@@ -398,7 +400,7 @@ class ZoomPoller:
         try:
             full = self.pf.get(
                 f"/task/{task_id}",
-                params={"fields": "id,name,description,status,owner,assignees,startDateTime,endDateTime,project"},
+                params={"fields": "id,name,description,status,owner,assignees,startDateTime,endDateTime,project,object,template"},
             )
             full_task = full.get("task", full)
         except Exception as e:
