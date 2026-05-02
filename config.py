@@ -42,8 +42,12 @@ class Config:
     zoom_default_duration_min: int = 60    # Длительность по умолчанию
     zoom_timezone: str = "Europe/Moscow"
 
+    # ─── Telegram ─────────────────────────────────────────────────────────────
+    telegram_bot_token: str = ""        # Bot Token из BotFather
+    telegram_chat_id: str = ""          # ID группы/чата для уведомлений
+
     # ─── Webhook-сервер ───────────────────────────────────────────────────────
-    webhook_secret: str = ""           # Секрет для проверки подписи PlanFix
+    webhook_secret: str = ""
     server_port: int = 8000
     log_level: str = "INFO"
 
@@ -73,6 +77,9 @@ class Config:
         self.zoom_client_secret = os.environ.get("ZOOM_CLIENT_SECRET", self.zoom_client_secret)
         self.zoom_default_duration_min = int(os.environ.get("ZOOM_DEFAULT_DURATION_MIN", self.zoom_default_duration_min))
         self.zoom_timezone = os.environ.get("ZOOM_TIMEZONE", self.zoom_timezone)
+
+        self.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", self.telegram_bot_token)
+        self.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", self.telegram_chat_id)
 
         self.webhook_secret = os.environ.get("WEBHOOK_SECRET", self.webhook_secret)
         self.server_port = int(os.environ.get("SERVER_PORT", self.server_port))

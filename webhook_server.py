@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Request
 from config import Config
 from planfix_client import PlanfixClient, PlanfixAPIError
 from zoom_client import ZoomClient, ZoomAPIError
+from telegram_client import TelegramClient
 from poller import ZoomPoller
 
 # ─── Логирование ──────────────────────────────────────────────────────────────
@@ -48,9 +49,10 @@ logger = logging.getLogger("zoom-planfix")
 cfg = Config()
 pf = PlanfixClient(cfg.planfix_account, cfg.planfix_token)
 zoom = ZoomClient(cfg.zoom_account_id, cfg.zoom_client_id, cfg.zoom_client_secret)
+tg = TelegramClient(cfg.telegram_bot_token, cfg.telegram_chat_id) if cfg.telegram_bot_token else None
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
-poller = ZoomPoller(pf, zoom, cfg, poll_interval=POLL_INTERVAL)
+poller = ZoomPoller(pf, zoom, cfg, tg=tg, poll_interval=POLL_INTERVAL)
 _poller_task = None
 
 
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 Стартую сервер (poll={POLL_INTERVAL}s)")
     logger.info(f"   PlanFix:    {cfg.planfix_account}.planfix.com")
     logger.info(f"   Zoom:       account={cfg.zoom_account_id[:8]}...")
+    logger.info(f"   Telegram:   {'ENABLED chat=' + cfg.telegram_chat_id if tg else 'DISABLED'}")
     logger.info(f"   Timezone:   {cfg.zoom_timezone}")
 
     # Запускаем поллер

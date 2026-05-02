@@ -28,6 +28,7 @@ from typing import Optional
 
 from planfix_client import PlanfixClient, PlanfixAPIError
 from zoom_client import ZoomClient, ZoomAPIError
+from telegram_client import TelegramClient
 from time_utils import to_zoom_iso, calc_duration_minutes, format_meeting_time
 
 logger = logging.getLogger(__name__)
@@ -133,10 +134,12 @@ class ZoomPoller:
         pf: PlanfixClient,
         zoom: ZoomClient,
         cfg,
+        tg: TelegramClient = None,
         poll_interval: int = 60,
     ):
         self.pf = pf
         self.zoom = zoom
+        self.tg = tg
         self.cfg = cfg
         self.poll_interval = poll_interval
         self._processed_in_run = set()
@@ -353,10 +356,11 @@ class ZoomPoller:
         await self._create_meeting_for_task(task)
 
     async def _create_meeting_for_task(self, task: dict):
-        """Создать Zoom-встречу для задачи"""
+        """Создать Zoom-встречу для задачи + Telegram + комментарий в PlanFix"""
         task_id = task["id"]
         name = task.get("name", f"Конференция #{task_id}")
         topic = self._extract_topic(name)
+        pf_url = f"https://{self.cfg.planfix_account}.planfix.com/task/{task_id}"
 
         date_begin = self._extract_datetime(task.get("startDateTime") or task.get("dateBegin"))
         date_end = self._extract_datetime(task.get("endDateTime") or task.get("dateEnd"))
@@ -375,11 +379,25 @@ class ZoomPoller:
 
         start_time = to_zoom_iso(date_begin, self.cfg.zoom_timezone)
         duration = calc_duration_minutes(date_begin, date_end, self.cfg.zoom_default_duration_min)
+        time_str = format_meeting_time(date_begin, self.cfg.zoom_timezone)
+
+        # ── Шаг 1: уведомление в Telegram о новой задаче ──────────────────────
+        if self.tg:
+            self.tg.send_message_safe(
+                f"🆕 *Новая задача-конференция в PlanFix*\n\n"
+                f"📌 *Тема:* {topic}\n"
+                f"🕐 *Время:* {time_str}\n"
+                f"⏱ *Длительность:* {duration} мин\n"
+                f"🔗 [Открыть в PlanFix]({pf_url})\n\n"
+                f"_Создаю Zoom-встречу..._",
+                disable_web_page_preview=True,
+            )
 
         logger.info(
             f"Создаю Zoom-встречу для task {task_id}: '{topic}' @ {start_time} ({duration} min)"
         )
 
+        # ── Шаг 2: создаём встречу в Zoom ─────────────────────────────────────
         try:
             meeting = self.zoom.create_meeting(
                 topic=topic,
@@ -390,11 +408,14 @@ class ZoomPoller:
             )
         except Exception as e:
             logger.error(f"Zoom API ошибка: {e}")
-            self.pf.add_comment(
-                task_id,
-                f"❌ Не удалось создать Zoom-встречу: {e}",
-                silent=False,
-            )
+            try:
+                self.pf.add_comment(task_id, f"❌ Не удалось создать Zoom-встречу: {e}")
+            except Exception:
+                pass
+            if self.tg:
+                self.tg.send_message_safe(
+                    f"❌ *Ошибка создания Zoom-встречи*\nЗадача: {topic}\n`{e}`"
+                )
             return
 
         meeting_id = str(meeting["id"])
@@ -420,8 +441,7 @@ class ZoomPoller:
         except Exception as e:
             logger.warning(f"Не удалось обновить описание {task_id}: {e}")
 
-        # Добавляем красивый комментарий
-        time_str = format_meeting_time(date_begin, self.cfg.zoom_timezone)
+        # ── Шаг 4: комментарий в PlanFix со ссылкой ──────────────────────────
         comment = (
             f"🎥 **Zoom-конференция создана автоматически**\n\n"
             f"📌 **Тема:** {topic}\n"
@@ -439,7 +459,21 @@ class ZoomPoller:
         except Exception as e:
             logger.warning(f"Не удалось добавить комментарий: {e}")
 
-        # Создаём RSVP-подзадачи
+        # ── Шаг 5: уведомление в Telegram со ссылкой ─────────────────────────
+        if self.tg:
+            self.tg.send_message_safe(
+                f"✅ *Zoom-встреча создана!*\n\n"
+                f"📌 *Тема:* {topic}\n"
+                f"🕐 *Время:* {time_str}\n"
+                f"⏱ *Длительность:* {duration} мин\n\n"
+                f"🔗 *Ссылка для подключения:*\n{join_url}\n\n"
+                f"🔑 *Meeting ID:* `{meeting_id}`\n"
+                f"🔐 *Пароль:* `{password}`\n\n"
+                f"📋 [Задача в PlanFix]({pf_url})",
+                disable_web_page_preview=True,
+            )
+
+        # ── Шаг 6: RSVP-подзадачи для участников ─────────────────────────────
         await self._sync_rsvp_subtasks(task)
 
         logger.info(f"✅ Task {task_id}: Zoom meeting {meeting_id} создан")
@@ -503,9 +537,11 @@ class ZoomPoller:
             logger.warning(f"Не удалось обновить task {task_id}: {e}")
 
     async def _cancel_meeting(self, task: dict, meta: dict):
-        """Отменить Zoom-встречу"""
+        """Отменить Zoom-встречу + уведомить Telegram"""
         task_id = task["id"]
         meeting_id = meta.get("meeting_id")
+        topic = meta.get("topic", task.get("name", ""))
+        pf_url = f"https://{self.cfg.planfix_account}.planfix.com/task/{task_id}"
 
         try:
             self.zoom.delete_meeting(meeting_id)
@@ -520,9 +556,17 @@ class ZoomPoller:
         except Exception:
             pass
 
-        # Удаляем маркер из описания
+        if self.tg:
+            self.tg.send_message_safe(
+                f"🚫 *Zoom-конференция ОТМЕНЕНА*\n\n"
+                f"📌 *Тема:* {topic}\n"
+                f"🔑 *Meeting ID:* `{meeting_id}`\n\n"
+                f"📋 [Задача в PlanFix]({pf_url})",
+                disable_web_page_preview=True,
+            )
+
+        # Удаляем маркер из описания + добавляем флаг отмены
         new_desc = strip_meta(task.get("description") or "")
-        # Добавляем флаг отмены
         meta["cancelled"] = True
         meta["cancelled_at"] = datetime.utcnow().isoformat()
         new_desc = inject_meta(new_desc, meta)
