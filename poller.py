@@ -1,0 +1,475 @@
+"""
+Поллер PlanFix — умное обнаружение Zoom-задач БЕЗ настройки UI/автоматизаций.
+
+Принцип работы:
+  1. Каждую N секунд опрашивает PlanFix через REST API
+  2. Ищет задачи с признаками Zoom-конференции:
+     - Название содержит маркер: "ZOOM:", "ЗУМ:", "[ZOOM]", "#zoom"
+     - Или статус совпадает с PLANFIX_ZOOM_STATUS_ID (если задано в env)
+     - Или принадлежит проекту PLANFIX_ZOOM_PROJECT_ID
+  3. Для каждой найденной задачи проверяет состояние через скрытый маркер
+     в описании задачи и предпринимает действия:
+       - Нет маркера → создать Zoom-встречу
+       - Название/время изменились → обновить Zoom-встречу
+       - Появился тег #cancel или [ОТМЕНА] → удалить встречу
+       - Список участников изменился → синхронизировать RSVP-подзадачи
+
+Маркер в описании задачи (невидимый для пользователя):
+  <!-- ZOOM_META: {"meeting_id": "12345", "uuid": "xxx", "join_url": "...",
+                   "password": "...", "topic": "...", "start_time": "..."} -->
+"""
+import asyncio
+import json
+import logging
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from planfix_client import PlanfixClient, PlanfixAPIError
+from zoom_client import ZoomClient, ZoomAPIError
+from time_utils import to_zoom_iso, calc_duration_minutes, format_meeting_time
+
+logger = logging.getLogger(__name__)
+
+# ─── Маркеры распознавания ────────────────────────────────────────────────────
+
+ZOOM_TRIGGERS = [
+    r"^\s*ZOOM\s*[:\-—]",
+    r"^\s*ЗУМ\s*[:\-—]",
+    r"\[ZOOM\]",
+    r"\[ЗУМ\]",
+    r"#zoom\b",
+    r"#зум\b",
+    r"конференция\s+zoom",
+    r"конференция\s+зум",
+]
+
+CANCEL_MARKERS = [
+    r"\[ОТМЕНА\]",
+    r"\[ОТМЕНЕНА\]",
+    r"\[CANCELLED\]",
+    r"#cancel\b",
+    r"#отмена\b",
+]
+
+META_BEGIN = "<!-- ZOOM_META:"
+META_END = "-->"
+META_PATTERN = re.compile(r"<!--\s*ZOOM_META:\s*(\{[^}]+\})\s*-->", re.DOTALL)
+RSVP_MARKER = "[RSVP]"
+
+
+def is_zoom_task(task: dict, zoom_status_id: int = 0, zoom_project_id: int = 0) -> bool:
+    """Проверка, является ли задача Zoom-конференцией"""
+    name = task.get("name", "") or ""
+    for pat in ZOOM_TRIGGERS:
+        if re.search(pat, name, re.IGNORECASE):
+            return True
+
+    if zoom_status_id:
+        sid = task.get("status", {}).get("id")
+        if sid and int(sid) == zoom_status_id:
+            return True
+
+    if zoom_project_id:
+        pid = task.get("project", {}).get("id")
+        if pid and int(pid) == zoom_project_id:
+            return True
+
+    return False
+
+
+def is_cancellation_signal(task: dict) -> bool:
+    """Проверка признаков отмены конференции"""
+    name = task.get("name", "") or ""
+    desc = task.get("description", "") or ""
+    text = f"{name}\n{desc}"
+    for pat in CANCEL_MARKERS:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def extract_meta(description: str) -> Optional[dict]:
+    """Извлечь скрытый JSON-маркер из описания задачи"""
+    if not description or META_BEGIN not in description:
+        return None
+    m = META_PATTERN.search(description)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception as e:
+            logger.warning(f"Не удалось распарсить ZOOM_META: {e}")
+    return None
+
+
+def inject_meta(description: str, meta: dict) -> str:
+    """Записать/обновить скрытый маркер в описании"""
+    meta_str = json.dumps(meta, ensure_ascii=False)
+    new_marker = f"{META_BEGIN} {meta_str} {META_END}"
+
+    if META_BEGIN in (description or ""):
+        # Заменяем существующий
+        return META_PATTERN.sub(new_marker, description)
+    # Добавляем в конец
+    if description:
+        return f"{description}\n\n{new_marker}"
+    return new_marker
+
+
+def strip_meta(description: str) -> str:
+    """Убрать маркер из описания"""
+    if not description or META_BEGIN not in description:
+        return description
+    return META_PATTERN.sub("", description).strip()
+
+
+# ─── Главный поллер ───────────────────────────────────────────────────────────
+
+
+class ZoomPoller:
+    def __init__(
+        self,
+        pf: PlanfixClient,
+        zoom: ZoomClient,
+        cfg,
+        poll_interval: int = 60,
+    ):
+        self.pf = pf
+        self.zoom = zoom
+        self.cfg = cfg
+        self.poll_interval = poll_interval
+        self._processed_in_run = set()  # чтобы не обрабатывать одну задачу дважды за итерацию
+        self._last_modified_check = int(time.time()) - 3600  # с прошлого часа
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    async def run(self):
+        """Главный цикл поллинга"""
+        logger.info(
+            f"🔄 Поллер запущен. Интервал: {self.poll_interval}s. "
+            f"Аккаунт: {self.pf.base}"
+        )
+        while not self._stop:
+            try:
+                await self.tick()
+            except Exception as e:
+                logger.exception(f"Ошибка в poll-цикле: {e}")
+            await asyncio.sleep(self.poll_interval)
+
+    async def tick(self):
+        """Одна итерация поллинга"""
+        self._processed_in_run.clear()
+        now = int(time.time())
+
+        # Получаем задачи, изменённые с прошлой проверки (с запасом 5 мин)
+        since = self._last_modified_check - 300
+        tasks = self._fetch_recent_tasks(since)
+
+        if not tasks:
+            self._last_modified_check = now
+            return
+
+        zoom_tasks = [
+            t for t in tasks if is_zoom_task(
+                t,
+                zoom_status_id=self.cfg.status_active,
+                zoom_project_id=self.cfg.planfix_zoom_project_id,
+            )
+        ]
+
+        logger.info(f"Tick: {len(tasks)} изменённых задач, {len(zoom_tasks)} Zoom-задач")
+
+        for task in zoom_tasks:
+            if task["id"] in self._processed_in_run:
+                continue
+            try:
+                await self._process_task(task)
+            except Exception as e:
+                logger.exception(f"Ошибка обработки задачи {task.get('id')}: {e}")
+            self._processed_in_run.add(task["id"])
+
+        self._last_modified_check = now
+
+    def _fetch_recent_tasks(self, since_ts: int) -> list:
+        """Получить задачи, изменённые с момента since_ts"""
+        try:
+            res = self.pf.post("/task/list", {
+                "offset": 0,
+                "pageSize": 100,
+                "fields": "id,name,description,status,template,project,assignees,owner,priority,dateBegin,dateEnd,startDateTime,endDateTime",
+                "filters": [
+                    {"type": 4, "operator": "greaterOrEqual", "value": since_ts}
+                ],
+                "sort": [{"field": "dateChanged", "order": "desc"}],
+            })
+            return res.get("tasks", [])
+        except Exception as e:
+            logger.error(f"Не удалось получить задачи: {e}")
+            return []
+
+    async def _process_task(self, task_summary: dict):
+        """Обработать одну Zoom-задачу"""
+        task_id = task_summary["id"]
+
+        # Получаем полные данные задачи
+        try:
+            full = self.pf.get_task(task_id)
+        except Exception as e:
+            logger.error(f"Не удалось получить задачу {task_id}: {e}")
+            return
+
+        # PlanFix может вернуть минимальный объект — мерджим
+        task = {**task_summary, **(full or {})}
+        if not task.get("name"):
+            return  # пропускаем пустые
+
+        meta = extract_meta(task.get("description") or "")
+
+        # ─── Признак отмены ───────────────────────────────────────────────────
+        if is_cancellation_signal(task):
+            if meta and meta.get("meeting_id"):
+                await self._cancel_meeting(task, meta)
+            return
+
+        # ─── Уже создана — проверяем, надо ли обновить ────────────────────────
+        if meta and meta.get("meeting_id"):
+            await self._maybe_update_meeting(task, meta)
+            await self._sync_rsvp_subtasks(task)
+            return
+
+        # ─── Новая Zoom-задача — создаём встречу ──────────────────────────────
+        await self._create_meeting_for_task(task)
+
+    async def _create_meeting_for_task(self, task: dict):
+        """Создать Zoom-встречу для задачи"""
+        task_id = task["id"]
+        name = task.get("name", f"Конференция #{task_id}")
+        topic = self._extract_topic(name)
+
+        date_begin = task.get("dateBegin") or task.get("startDateTime")
+        date_end = task.get("dateEnd") or task.get("endDateTime")
+
+        if not date_begin:
+            logger.info(f"Task {task_id}: нет dateBegin — пропускаю")
+            try:
+                self.pf.add_comment(
+                    task_id,
+                    "⚠️ Чтобы автоматически создать Zoom-встречу — укажите дату и время начала задачи.",
+                    silent=True,
+                )
+            except Exception:
+                pass
+            return
+
+        start_time = to_zoom_iso(date_begin, self.cfg.zoom_timezone)
+        duration = calc_duration_minutes(date_begin, date_end, self.cfg.zoom_default_duration_min)
+
+        logger.info(
+            f"Создаю Zoom-встречу для task {task_id}: '{topic}' @ {start_time} ({duration} min)"
+        )
+
+        try:
+            meeting = self.zoom.create_meeting(
+                topic=topic,
+                start_time_iso=start_time,
+                duration_min=duration,
+                timezone=self.cfg.zoom_timezone,
+                agenda=f"PlanFix #{task_id}",
+            )
+        except Exception as e:
+            logger.error(f"Zoom API ошибка: {e}")
+            self.pf.add_comment(
+                task_id,
+                f"❌ Не удалось создать Zoom-встречу: {e}",
+                silent=False,
+            )
+            return
+
+        meeting_id = str(meeting["id"])
+        join_url = meeting["join_url"]
+        password = meeting.get("password", "")
+        uuid = meeting.get("uuid", "")
+
+        # Сохраняем метаданные в описании
+        meta = {
+            "meeting_id": meeting_id,
+            "uuid": uuid,
+            "join_url": join_url,
+            "password": password,
+            "topic": topic,
+            "start_time": start_time,
+            "duration": duration,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+        new_desc = inject_meta(task.get("description") or "", meta)
+        try:
+            self.pf.update_task(task_id, {"description": new_desc})
+        except Exception as e:
+            logger.warning(f"Не удалось обновить описание {task_id}: {e}")
+
+        # Добавляем красивый комментарий
+        time_str = format_meeting_time(date_begin, self.cfg.zoom_timezone)
+        comment = (
+            f"🎥 **Zoom-конференция создана автоматически**\n\n"
+            f"📌 **Тема:** {topic}\n"
+            f"🕐 **Время:** {time_str}\n"
+            f"⏱ **Длительность:** {duration} мин\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 **Ссылка для подключения:**\n{join_url}\n\n"
+            f"🔑 **Meeting ID:** `{meeting_id}`\n"
+            f"🔐 **Пароль:** `{password}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💡 Чтобы отменить — добавьте `[ОТМЕНА]` в название задачи или `#cancel` в описание."
+        )
+        try:
+            self.pf.add_comment(task_id, comment)
+        except Exception as e:
+            logger.warning(f"Не удалось добавить комментарий: {e}")
+
+        # Создаём RSVP-подзадачи
+        await self._sync_rsvp_subtasks(task)
+
+        logger.info(f"✅ Task {task_id}: Zoom meeting {meeting_id} создан")
+
+    async def _maybe_update_meeting(self, task: dict, meta: dict):
+        """Проверить, изменились ли тема/время и обновить Zoom-встречу при необходимости"""
+        task_id = task["id"]
+        new_topic = self._extract_topic(task.get("name", ""))
+        date_begin = task.get("dateBegin") or task.get("startDateTime")
+
+        if not date_begin:
+            return
+
+        new_start = to_zoom_iso(date_begin, self.cfg.zoom_timezone)
+        new_duration = calc_duration_minutes(
+            date_begin,
+            task.get("dateEnd") or task.get("endDateTime"),
+            self.cfg.zoom_default_duration_min,
+        )
+
+        # Сравниваем с тем, что было
+        changed_topic = new_topic != meta.get("topic")
+        changed_time = new_start != meta.get("start_time")
+        changed_dur = new_duration != meta.get("duration")
+
+        if not (changed_topic or changed_time or changed_dur):
+            return
+
+        try:
+            self.zoom.update_meeting(
+                meeting_id=meta["meeting_id"],
+                topic=new_topic if changed_topic else None,
+                start_time_iso=new_start if changed_time else None,
+                duration_min=new_duration if changed_dur else None,
+                timezone=self.cfg.zoom_timezone,
+            )
+        except Exception as e:
+            logger.error(f"Zoom update error for {meta['meeting_id']}: {e}")
+            return
+
+        # Обновляем метаданные
+        meta.update({
+            "topic": new_topic,
+            "start_time": new_start,
+            "duration": new_duration,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+        new_desc = inject_meta(task.get("description") or "", meta)
+        try:
+            self.pf.update_task(task_id, {"description": new_desc})
+            time_str = format_meeting_time(date_begin, self.cfg.zoom_timezone)
+            self.pf.add_comment(
+                task_id,
+                f"📅 **Zoom-встреча обновлена**\n"
+                f"Новая тема: {new_topic}\n"
+                f"Новое время: {time_str}\n"
+                f"Длительность: {new_duration} мин",
+            )
+            logger.info(f"Task {task_id}: Zoom meeting {meta['meeting_id']} обновлён")
+        except Exception as e:
+            logger.warning(f"Не удалось обновить task {task_id}: {e}")
+
+    async def _cancel_meeting(self, task: dict, meta: dict):
+        """Отменить Zoom-встречу"""
+        task_id = task["id"]
+        meeting_id = meta.get("meeting_id")
+
+        try:
+            self.zoom.delete_meeting(meeting_id)
+        except Exception as e:
+            logger.error(f"Не удалось удалить Zoom встречу {meeting_id}: {e}")
+
+        try:
+            self.pf.add_comment(
+                task_id,
+                f"🚫 **Zoom-встреча отменена**\n\nMeeting ID `{meeting_id}` удалён из Zoom.",
+            )
+        except Exception:
+            pass
+
+        # Удаляем маркер из описания
+        new_desc = strip_meta(task.get("description") or "")
+        # Добавляем флаг отмены
+        meta["cancelled"] = True
+        meta["cancelled_at"] = datetime.utcnow().isoformat()
+        new_desc = inject_meta(new_desc, meta)
+        try:
+            self.pf.update_task(task_id, {"description": new_desc})
+        except Exception:
+            pass
+
+        logger.info(f"Task {task_id}: встреча {meeting_id} отменена")
+
+    async def _sync_rsvp_subtasks(self, task: dict):
+        """Создать RSVP-подзадачи для всех участников, у которых их ещё нет"""
+        task_id = task["id"]
+        participants = self.pf.get_task_participants(task)
+        if not participants:
+            return
+
+        try:
+            existing_subtasks = self.pf.get_subtasks(task_id)
+        except Exception:
+            existing_subtasks = []
+
+        existing_users = set()
+        for st in existing_subtasks:
+            if RSVP_MARKER in (st.get("name") or ""):
+                for u in (st.get("assignees", {}) or {}).get("users", []):
+                    existing_users.add(u.get("id"))
+
+        for p in participants:
+            uid = p.get("id")
+            if not uid or uid in existing_users:
+                continue
+            uname = p.get("name", f"Участник {uid}")
+
+            try:
+                self.pf.create_subtask(
+                    parent_task_id=task_id,
+                    name=f"{RSVP_MARKER} {uname} — подтвердите участие",
+                    description=(
+                        f"👋 {uname}, подтвердите участие в конференции.\n\n"
+                        f"Измените статус этой задачи:\n"
+                        f"  ✅ **«В работе»** = БУДУ\n"
+                        f"  ✔ **«Завершенная»** = подтверждено\n"
+                        f"  ❌ Закройте задачу с тегом #notgoing = НЕ БУДУ\n\n"
+                        f"_Только вы можете изменить эту задачу_"
+                    ),
+                    assignee_id=uid,
+                )
+                logger.info(f"Создана RSVP-подзадача для {uname} в task {task_id}")
+            except Exception as e:
+                logger.warning(f"Не удалось создать RSVP для {uname}: {e}")
+
+    @staticmethod
+    def _extract_topic(name: str) -> str:
+        """Извлечь чистую тему встречи (убираем триггерные префиксы)"""
+        cleaned = name
+        for pat in ZOOM_TRIGGERS + CANCEL_MARKERS:
+            cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip(" :-—") or name
