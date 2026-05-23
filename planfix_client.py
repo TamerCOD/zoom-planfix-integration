@@ -167,39 +167,35 @@ class PlanfixClient:
 
     def get_task_participants(self, task: dict) -> list:
         """
-        Извлечь всех участников задачи:
-        - assignees (исполнители)
-        - owner (постановщик)
-        - auditors (аудиторы/наблюдатели)
-        Возвращает список уникальных {"id": N, "name": "..."}
+        Извлечь УЧАСТНИКОВ задачи — то что PlanFix называет «Участники» (поле `participants.users`).
+
+        ⚠️ ВАЖНО: это НЕ Исполнители (assignees) и НЕ Постановщик (owner).
+        Это отдельное поле «Участники» которое автор задачи заполняет в карточке.
+        Именно для этих людей создаются RSVP-подзадачи.
+
+        Если поле participants пустое — fallback на assignees (для совместимости со старыми задачами).
         """
         seen = set()
-        participants = []
+        result = []
 
         def add_user(u: dict):
             uid = u.get("id")
             if uid and uid not in seen:
                 seen.add(uid)
-                participants.append(u)
+                result.append(u)
 
-        for user in task.get("assignees", {}).get("users", []):
-            add_user(user)
-        for group in task.get("assignees", {}).get("groups", []):
-            # Для групп нужно отдельно получить состав — пропускаем в базовой версии
-            pass
-
-        owner = task.get("owner") or task.get("responsible")
-        if isinstance(owner, dict) and owner.get("id"):
-            add_user(owner)
-
-        for user in task.get("auditors", {}).get("users", []):
+        # 1) ОСНОВНОЙ источник — поле «Участники» (participants)
+        for user in task.get("participants", {}).get("users", []) or []:
             add_user(user)
 
-        # Поле "members" — явный список участников, если он задан
-        for user in task.get("members", {}).get("users", []):
-            add_user(user)
+        # 2) Fallback — если participants пусто, используем assignees (для старых задач)
+        if not result:
+            for user in task.get("assignees", {}).get("users", []) or []:
+                add_user(user)
+            for user in task.get("members", {}).get("users", []) or []:
+                add_user(user)
 
-        return participants
+        return result
 
     def get_statuses(self) -> list:
         """Получить все статусы задач аккаунта (для настройки)"""

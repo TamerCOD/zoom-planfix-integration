@@ -364,7 +364,7 @@ class ZoomPoller:
                     r = self.pf.post("/task/list", {
                         "offset": offset,
                         "pageSize": 100,
-                        "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime,object,template",
+                        "fields": "id,name,description,status,project,assignees,owner,participants,members,startDateTime,endDateTime,object,template",
                     })
                     items = r.get("tasks", [])
                     if not items:
@@ -385,7 +385,7 @@ class ZoomPoller:
                 r = self.pf.post("/task/list", {
                     "offset": offset,
                     "pageSize": 100,
-                    "fields": "id,name,description,status,project,assignees,owner,startDateTime,endDateTime,object,template",
+                    "fields": "id,name,description,status,project,assignees,owner,participants,members,startDateTime,endDateTime,object,template",
                 })
                 items = r.get("tasks", [])
                 if not items:
@@ -667,10 +667,28 @@ class ZoomPoller:
         }
 
         new_desc = inject_meta(task.get("description") or "", meta)
+
+        # Готовим кастомные поля Zoom (если ID заданы в env)
+        custom_fields = []
+        if self.cfg.field_zoom_meeting_id:
+            custom_fields.append({"field": {"id": self.cfg.field_zoom_meeting_id}, "value": meeting_id})
+        if self.cfg.field_zoom_join_url:
+            custom_fields.append({"field": {"id": self.cfg.field_zoom_join_url}, "value": join_url})
+        if self.cfg.field_zoom_password:
+            custom_fields.append({"field": {"id": self.cfg.field_zoom_password}, "value": password})
+        if self.cfg.field_zoom_uuid:
+            custom_fields.append({"field": {"id": self.cfg.field_zoom_uuid}, "value": uuid})
+
+        update_body = {"description": new_desc}
+        if custom_fields:
+            update_body["customFieldData"] = custom_fields
+
         try:
-            self.pf.update_task(task_id, {"description": new_desc})
+            self.pf.update_task(task_id, update_body)
+            if custom_fields:
+                logger.info(f"Task {task_id}: установлены кастомные поля Zoom (поля={len(custom_fields)})")
         except Exception as e:
-            logger.warning(f"Не удалось обновить описание {task_id}: {e}")
+            logger.warning(f"Не удалось обновить task {task_id}: {e}")
 
         # ── Шаг 4: комментарий в PlanFix со ссылкой (HTML — PlanFix вырезает \n) ─
         comment = (
