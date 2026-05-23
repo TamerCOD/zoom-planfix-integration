@@ -21,6 +21,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -223,6 +224,14 @@ class ZoomPoller:
         # ⛔ Гарантированный кэш: если уже создали встречу для task_id — больше НИКОГДА не создаём
         # {task_id: meeting_id}
         self._created_meetings: dict = {}
+        # Время первого обнаружения задачи: {task_id: unix_ts}
+        # Используется чтобы НЕ создавать встречу сразу при создании задачи
+        # (даём пользователю время заполнить форму)
+        self._task_first_seen: dict = {}
+        # Грейс-период перед обработкой (секунд)
+        self._creation_grace_period_s = int(os.environ.get("CREATION_GRACE_PERIOD", "90"))
+        # Кэш статусов RSVP-подзадач для детекции изменений: {rsvp_id: last_status_id}
+        self._rsvp_status_cache: dict = {}
         # Менеджер напоминаний
         self.reminders = ReminderManager(pf, tg, cfg)
 
@@ -298,6 +307,12 @@ class ZoomPoller:
         except Exception as e:
             logger.exception(f"Ошибка в reminder check: {e}")
 
+        # ─── Проверяем изменения статусов RSVP-подзадач (Буду/Не буду) ────────
+        try:
+            await self._check_rsvp_responses(tasks)
+        except Exception as e:
+            logger.exception(f"Ошибка в RSVP check: {e}")
+
         for task in new_zoom_tasks:
             if task["id"] in self._processed_in_run:
                 continue
@@ -367,7 +382,7 @@ class ZoomPoller:
                     r = self.pf.post("/task/list", {
                         "offset": offset,
                         "pageSize": 100,
-                        "fields": "id,name,description,status,project,assignees,owner,participants,members,startDateTime,endDateTime,object,template",
+                        "fields": "id,name,description,status,project,assignees,owner,participants,members,startDateTime,endDateTime,object,template,parent",
                     })
                     items = r.get("tasks", [])
                     if not items:
@@ -388,7 +403,7 @@ class ZoomPoller:
                 r = self.pf.post("/task/list", {
                     "offset": offset,
                     "pageSize": 100,
-                    "fields": "id,name,description,status,project,assignees,owner,participants,members,startDateTime,endDateTime,object,template",
+                    "fields": "id,name,description,status,project,assignees,owner,participants,members,startDateTime,endDateTime,object,template,parent",
                 })
                 items = r.get("tasks", [])
                 if not items:
@@ -445,6 +460,35 @@ class ZoomPoller:
             return  # пропускаем пустые
 
         meta = extract_meta(task.get("description") or "")
+
+        # ⏳ ГРЕЙС-ПЕРИОД: если задача только что появилась и встреча ещё не создана —
+        # ждём пока пользователь закончит заполнять форму (добавит участников)
+        if not meta or not meta.get("meeting_id"):
+            now_ts = int(time.time())
+            first_seen = self._task_first_seen.get(task_id)
+            if first_seen is None:
+                self._task_first_seen[task_id] = now_ts
+                logger.info(
+                    f"Task {task_id}: впервые увидел, жду {self._creation_grace_period_s} сек "
+                    f"перед обработкой (даём время заполнить форму)"
+                )
+                return
+            elapsed = now_ts - first_seen
+            if elapsed < self._creation_grace_period_s:
+                remaining = self._creation_grace_period_s - elapsed
+                logger.info(f"Task {task_id}: грейс-период ещё {remaining} сек")
+                return
+
+            # ✅ Проверяем что есть participants — иначе бессмысленно создавать
+            participants = self.pf.get_task_participants(task)
+            if not participants:
+                logger.info(
+                    f"Task {task_id}: грейс-период вышел, но participants пусто — "
+                    f"продолжаю ждать (пока юзер не добавит)"
+                )
+                # Не сбрасываем first_seen — но ждём ещё столько же
+                self._task_first_seen[task_id] = now_ts - self._creation_grace_period_s // 2
+                return
 
         # ⛔ ГАРАНТИРОВАННАЯ защита от повторного создания:
         # если встреча уже создавалась в этой сессии — никогда не создаём заново
@@ -867,6 +911,152 @@ class ZoomPoller:
             pass
 
         logger.info(f"Task {task_id}: встреча {meeting_id} отменена")
+
+    async def _check_rsvp_responses(self, all_tail_tasks: list):
+        """
+        Детект изменения статуса RSVP-подзадач.
+
+        Когда пользователь нажимает кнопку «Буду» (или меняет статус подзадачи на
+        «Завершенная» / «Отказ») — добавляем комментарии:
+          - в подзадаче: «Ваш ответ принят»
+          - в родительской задаче: «<Имя> подтвердил/отказался»
+        И отправляем уведомление в Telegram.
+
+        Идентификация RSVP-подзадачи — по префиксу [RSVP] в названии.
+        Кэш статусов хранится в памяти.
+        """
+        # Фильтруем только RSVP-подзадачи
+        rsvp_subtasks = [
+            t for t in all_tail_tasks
+            if RSVP_MARKER in (t.get("name") or "")
+        ]
+
+        for st in rsvp_subtasks:
+            sid = st["id"]
+            new_status_id = (st.get("status") or {}).get("id")
+            if not new_status_id:
+                continue
+
+            old_status_id = self._rsvp_status_cache.get(sid)
+
+            # При первом обнаружении — просто запоминаем
+            if old_status_id is None:
+                self._rsvp_status_cache[sid] = new_status_id
+                continue
+
+            # Статус не изменился — пропускаем
+            if old_status_id == new_status_id:
+                continue
+
+            # Статус ИЗМЕНИЛСЯ — обработать
+            self._rsvp_status_cache[sid] = new_status_id
+            try:
+                await self._handle_rsvp_status_change(st, new_status_id)
+            except Exception as e:
+                logger.exception(f"Ошибка обработки изменения RSVP {sid}: {e}")
+
+    async def _handle_rsvp_status_change(self, subtask: dict, new_status_id: int):
+        """
+        Обработать изменение статуса RSVP-подзадачи.
+        Статусы (стандартные PlanFix):
+          1 = Новая (= ожидание)
+          2 = В работе (= БУДУ)
+          3 = Завершенная (= БУДУ / подтверждено)
+          6 = Выполненная (= БУДУ)
+          Любой другой закрытый статус = НЕ БУДУ
+        """
+        sid = subtask["id"]
+        parent_id = (subtask.get("parent") or {}).get("id")
+        name = subtask.get("name", "")
+
+        # Извлекаем имя участника из названия "[RSVP] ИМЯ: будете на встрече?"
+        m = re.search(r"\[RSVP\]\s+(.+?):", name)
+        participant_name = m.group(1).strip() if m else "Участник"
+
+        # Получаем имя статуса для отображения
+        status_info = subtask.get("status") or {}
+        status_name = status_info.get("name", f"id={new_status_id}")
+
+        # Определяем — Буду или Не буду
+        # Закрытые статусы: 3 (Завершенная), 6 (Выполненная), и пользовательские «Отказ»
+        is_attending = None
+        positive_statuses = {2, 3, 6}  # В работе, Завершенная, Выполненная
+        if new_status_id in positive_statuses:
+            is_attending = True
+        elif "отказ" in status_name.lower() or "не буду" in status_name.lower():
+            is_attending = False
+        else:
+            # Неизвестный статус — не реагируем
+            logger.info(f"RSVP {sid}: статус '{status_name}' — нейтральный, не комментирую")
+            return
+
+        # ── Комментарий в подзадаче ──────────────────────────────────────────
+        if is_attending:
+            subtask_comment = (
+                f'<b>✅ Ответ принят</b><br><br>'
+                f'Вы подтвердили участие в Zoom-конференции.<br>'
+                f'Ссылка на встречу — в комментариях родительской задачи.'
+            )
+            parent_comment = (
+                f'<b>✅ {participant_name} подтвердил(а) участие</b><br><br>'
+                f'Статус подзадачи: {status_name}'
+            )
+            tg_msg = f"✅ *{participant_name}* подтвердил(а) участие в Zoom-встрече"
+        else:
+            subtask_comment = (
+                f'<b>🚫 Ответ принят</b><br><br>'
+                f'Вы отказались от участия в Zoom-конференции.'
+            )
+            parent_comment = (
+                f'<b>🚫 {participant_name} отказался(ась) от участия</b><br><br>'
+                f'Статус подзадачи: {status_name}'
+            )
+            tg_msg = f"🚫 *{participant_name}* отказался(ась) от Zoom-встречи"
+
+        # 1) Комментарий в подзадаче
+        try:
+            self.pf.add_comment(sid, subtask_comment)
+        except Exception as e:
+            logger.warning(f"RSVP {sid}: не удалось добавить комментарий в подзадаче: {e}")
+
+        # 2) Комментарий в родительской задаче
+        if parent_id:
+            try:
+                self.pf.add_comment(parent_id, parent_comment)
+            except Exception as e:
+                logger.warning(f"RSVP {sid}: не удалось добавить комментарий в parent {parent_id}: {e}")
+
+            # Получаем мета родителя для упоминания темы
+            try:
+                full_parent = self.pf.get(
+                    f"/task/{parent_id}",
+                    params={"fields": "id,name,description"},
+                )
+                parent_task = full_parent.get("task", full_parent)
+                meta = extract_meta(parent_task.get("description") or "")
+                topic = (meta or {}).get("topic", parent_task.get("name", ""))
+                pf_url = f"https://{self.cfg.planfix_account}.planfix.com/task/{parent_id}"
+                if self.tg:
+                    self.tg.send_message_safe(
+                        f"{tg_msg}\n\n"
+                        f"📌 *Встреча:* {topic}\n"
+                        f"📋 [Открыть задачу]({pf_url})",
+                        disable_web_page_preview=True,
+                    )
+            except Exception:
+                pass
+
+        # 3) Если БУДУ — закрываем подзадачу автоматически (статус «Завершенная» = id 3)
+        # (если статус был «В работе» = 2 — переводим в Завершенная)
+        if is_attending and new_status_id == 2:
+            try:
+                self.pf.update_task(sid, {"status": {"id": 3}})
+                logger.info(f"RSVP {sid}: автоматически закрыл (статус → Завершенная)")
+                self._rsvp_status_cache[sid] = 3
+            except Exception as e:
+                logger.warning(f"RSVP {sid}: не удалось автозакрыть: {e}")
+
+        logger.info(f"RSVP {sid} ({participant_name}): обработано — {'БУДУ' if is_attending else 'НЕ БУДУ'}")
 
     async def _sync_rsvp_subtasks(self, task: dict):
         """
