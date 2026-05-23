@@ -120,10 +120,17 @@ class PlanfixClient:
         parent_task_id: int,
         name: str,
         description: str = "",
-        assignee_id: int = None,
+        assignee_id=None,
         status_id: int = None,
+        object_id: int = None,
     ) -> dict:
-        """Создать подзадачу (используется для RSVP)"""
+        """
+        Создать подзадачу. PlanFix ждёт ID в формате "user:N" — приводим автоматически.
+
+        Args:
+          assignee_id: int или строка вида "user:N" — исполнитель подзадачи
+          object_id: ID шаблона/объекта (например, ZOOM-RSVP с кнопками Буду/Не буду)
+        """
         body: dict = {
             "name": name,
             "parent": {"id": parent_task_id},
@@ -131,9 +138,19 @@ class PlanfixClient:
         if description:
             body["description"] = description
         if assignee_id:
-            body["assignees"] = {"users": [{"id": assignee_id}]}
+            # PlanFix принимает оба формата при чтении, но при создании надёжнее "user:N"
+            if isinstance(assignee_id, int):
+                assignee_str = f"user:{assignee_id}"
+            else:
+                # Если строка — добавляем префикс если его нет
+                s = str(assignee_id)
+                assignee_str = s if s.startswith("user:") else f"user:{s}"
+            body["assignees"] = {"users": [{"id": assignee_str}]}
         if status_id:
             body["status"] = {"id": status_id}
+        if object_id:
+            body["object"] = {"id": object_id}
+            body["template"] = {"id": object_id}
         return self.post("/task", body)
 
     def get_subtasks(self, parent_task_id: int) -> list:

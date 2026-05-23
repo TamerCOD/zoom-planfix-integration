@@ -15,6 +15,9 @@ class Config:
     # ID шаблона задачи "Конференция ZOOM" (узнать через API или URL в браузере)
     planfix_zoom_template_id: int = 0
 
+    # ID объекта "ZOOM-RSVP" — используется для RSVP-подзадач (с кнопками Буду/Не буду)
+    planfix_rsvp_template_id: int = 0
+
     # ID проекта, где создаются конференции (если нужна фильтрация по проекту)
     planfix_zoom_project_id: int = 0
 
@@ -56,6 +59,7 @@ class Config:
         self.planfix_account = os.environ.get("PLANFIX_ACCOUNT", self.planfix_account)
         self.planfix_token = os.environ.get("PLANFIX_TOKEN", self.planfix_token)
         self.planfix_zoom_template_id = int(os.environ.get("PLANFIX_ZOOM_TEMPLATE_ID", self.planfix_zoom_template_id))
+        self.planfix_rsvp_template_id = int(os.environ.get("PLANFIX_RSVP_TEMPLATE_ID", self.planfix_rsvp_template_id))
         self.planfix_zoom_project_id = int(os.environ.get("PLANFIX_ZOOM_PROJECT_ID", self.planfix_zoom_project_id))
 
         self.status_new = int(os.environ.get("STATUS_NEW", self.status_new))

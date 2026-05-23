@@ -883,10 +883,14 @@ class ZoomPoller:
                     name=f"{RSVP_MARKER} {uname}: будете на встрече?",
                     description=description,
                     assignee_id=uid,
+                    object_id=self.cfg.planfix_rsvp_template_id or None,
                 )
                 rsvp_users.add(uid)
                 created_any = True
-                logger.info(f"✅ RSVP-подзадача создана для {uname} (uid={uid}) в task {task_id}")
+                logger.info(
+                    f"✅ RSVP-подзадача создана для {uname} (uid={uid}) в task {task_id} "
+                    f"(rsvp_object={self.cfg.planfix_rsvp_template_id or 'default'})"
+                )
             except Exception as e:
                 logger.warning(f"Не удалось создать RSVP для {uname}: {e}")
 
