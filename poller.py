@@ -468,40 +468,32 @@ class ZoomPoller:
 
         meta = extract_meta(task.get("description") or "")
 
-        # ⏳ ГРЕЙС-ПЕРИОД (применяется ТОЛЬКО к polling, не к webhook)
-        # Если триггер пришёл из PlanFix Автоматизации (force=True) — обрабатываем сразу,
-        # т.к. событие «Задача создана» в PlanFix фиксируется ПОСЛЕ сохранения формы.
-        if not force and (not meta or not meta.get("meeting_id")):
-            now_ts = int(time.time())
-            first_seen = self._task_first_seen.get(task_id)
-            if first_seen is None:
-                self._task_first_seen[task_id] = now_ts
-                logger.info(
-                    f"Task {task_id}: polling — жду {self._creation_grace_period_s} сек "
-                    f"(или используйте webhook автоматизацию PlanFix для мгновенной обработки)"
-                )
-                return
-            elapsed = now_ts - first_seen
-            if elapsed < self._creation_grace_period_s:
+        # 🎯 УМНАЯ ЛОГИКА — без жёсткой задержки:
+        # Создаём встречу как только есть participants + startDateTime
+        # Если ничего нет — ждём (без таймаута, проверяем каждый тик)
+        if not meta or not meta.get("meeting_id"):
+            participants = self.pf.get_task_participants(task)
+            has_start = bool(
+                self._extract_datetime(task.get("startDateTime") or task.get("dateBegin"))
+            )
+
+            if not participants:
+                if task_id not in self._task_first_seen:
+                    self._task_first_seen[task_id] = int(time.time())
+                    logger.info(f"Task {task_id}: впервые обнаружена, жду пока добавят participants")
                 return
 
-            # ✅ Проверяем participants — иначе бессмысленно создавать
-            participants = self.pf.get_task_participants(task)
-            if not participants:
-                logger.info(f"Task {task_id}: participants пусто — продолжаю ждать")
-                self._task_first_seen[task_id] = now_ts - self._creation_grace_period_s // 2
+            if not has_start:
+                logger.info(f"Task {task_id}: есть participants но нет даты начала — жду")
+                if task_id not in self._task_first_seen:
+                    self._task_first_seen[task_id] = int(time.time())
                 return
-        elif force:
-            logger.info(f"Task {task_id}: webhook trigger — обрабатываю мгновенно (без грейс-периода)")
-            # Проверим что есть участники (если задача только-только создана)
-            participants = self.pf.get_task_participants(task)
-            if not participants and not (meta and meta.get("meeting_id")):
-                logger.warning(
-                    f"Task {task_id}: webhook вызван, но participants пусто. "
-                    f"Возможно автоматизация настроена на 'Задача создана' до того как добавили участников. "
-                    f"Поллер обработает позже когда увидит participants."
-                )
-                return
+
+            # Всё готово — обрабатываем!
+            logger.info(
+                f"Task {task_id}: готова к обработке "
+                f"(participants={len(participants)}, force={force})"
+            )
 
         # ⛔ ГАРАНТИРОВАННАЯ защита от повторного создания:
         # если встреча уже создавалась в этой сессии — никогда не создаём заново
