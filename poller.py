@@ -430,8 +430,15 @@ class ZoomPoller:
         }, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(key.encode()).hexdigest()
 
-    async def _process_task(self, task_summary: dict):
-        """Обработать одну Zoom-задачу с локом против race condition"""
+    async def _process_task(self, task_summary: dict, force: bool = False):
+        """
+        Обработать одну Zoom-задачу с локом против race condition.
+
+        Args:
+            force: если True — пропускаем грейс-период (например, для webhook events).
+                   Webhook от PlanFix Автоматизации триггерится ПОСЛЕ создания задачи,
+                   поэтому участники уже добавлены и можно сразу обрабатывать.
+        """
         task_id = task_summary["id"]
 
         lock = self._get_lock(task_id)
@@ -440,9 +447,9 @@ class ZoomPoller:
             return
 
         async with lock:
-            await self._process_task_locked(task_id, task_summary)
+            await self._process_task_locked(task_id, task_summary, force=force)
 
-    async def _process_task_locked(self, task_id: int, task_summary: dict):
+    async def _process_task_locked(self, task_id: int, task_summary: dict, force: bool = False):
         # Получаем полные данные задачи (с владельцем и описанием)
         try:
             full = self.pf.get(
@@ -461,33 +468,39 @@ class ZoomPoller:
 
         meta = extract_meta(task.get("description") or "")
 
-        # ⏳ ГРЕЙС-ПЕРИОД: если задача только что появилась и встреча ещё не создана —
-        # ждём пока пользователь закончит заполнять форму (добавит участников)
-        if not meta or not meta.get("meeting_id"):
+        # ⏳ ГРЕЙС-ПЕРИОД (применяется ТОЛЬКО к polling, не к webhook)
+        # Если триггер пришёл из PlanFix Автоматизации (force=True) — обрабатываем сразу,
+        # т.к. событие «Задача создана» в PlanFix фиксируется ПОСЛЕ сохранения формы.
+        if not force and (not meta or not meta.get("meeting_id")):
             now_ts = int(time.time())
             first_seen = self._task_first_seen.get(task_id)
             if first_seen is None:
                 self._task_first_seen[task_id] = now_ts
                 logger.info(
-                    f"Task {task_id}: впервые увидел, жду {self._creation_grace_period_s} сек "
-                    f"перед обработкой (даём время заполнить форму)"
+                    f"Task {task_id}: polling — жду {self._creation_grace_period_s} сек "
+                    f"(или используйте webhook автоматизацию PlanFix для мгновенной обработки)"
                 )
                 return
             elapsed = now_ts - first_seen
             if elapsed < self._creation_grace_period_s:
-                remaining = self._creation_grace_period_s - elapsed
-                logger.info(f"Task {task_id}: грейс-период ещё {remaining} сек")
                 return
 
-            # ✅ Проверяем что есть participants — иначе бессмысленно создавать
+            # ✅ Проверяем participants — иначе бессмысленно создавать
             participants = self.pf.get_task_participants(task)
             if not participants:
-                logger.info(
-                    f"Task {task_id}: грейс-период вышел, но participants пусто — "
-                    f"продолжаю ждать (пока юзер не добавит)"
-                )
-                # Не сбрасываем first_seen — но ждём ещё столько же
+                logger.info(f"Task {task_id}: participants пусто — продолжаю ждать")
                 self._task_first_seen[task_id] = now_ts - self._creation_grace_period_s // 2
+                return
+        elif force:
+            logger.info(f"Task {task_id}: webhook trigger — обрабатываю мгновенно (без грейс-периода)")
+            # Проверим что есть участники (если задача только-только создана)
+            participants = self.pf.get_task_participants(task)
+            if not participants and not (meta and meta.get("meeting_id")):
+                logger.warning(
+                    f"Task {task_id}: webhook вызван, но participants пусто. "
+                    f"Возможно автоматизация настроена на 'Задача создана' до того как добавили участников. "
+                    f"Поллер обработает позже когда увидит participants."
+                )
                 return
 
         # ⛔ ГАРАНТИРОВАННАЯ защита от повторного создания:

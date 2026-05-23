@@ -204,16 +204,17 @@ async def dashboard():
 
 
 @app.get("/process/{task_id}")
+@app.post("/process/{task_id}")
 async def process_task(task_id: int):
-    """Принудительно обработать конкретную задачу (без ожидания poll)"""
+    """Принудительно обработать конкретную задачу (без ожидания poll, без грейс-периода)"""
     try:
         task = pf.get(
             f"/task/{task_id}",
-            params={"fields": "id,name,description,status,owner,assignees,startDateTime,endDateTime"},
+            params={"fields": "id,name,description,status,owner,assignees,participants,startDateTime,endDateTime,object,template"},
         )
         full_task = task.get("task", task)
-        await poller._process_task(full_task)
-        return {"status": "ok", "task_id": task_id}
+        await poller._process_task(full_task, force=True)
+        return {"status": "ok", "task_id": task_id, "mode": "instant"}
     except Exception as e:
         logger.exception(f"Manual process failed for {task_id}")
         return {"status": "error", "message": str(e)}
@@ -235,11 +236,15 @@ async def planfix_webhook(request: Request):
     logger.info(f"Webhook received: task_id={task_id}, event={data.get('event')}")
 
     if task_id:
-        # Триггерим обработку конкретной задачи
+        # Триггерим обработку конкретной задачи СРАЗУ (force=True пропускает грейс-период)
         try:
-            full = pf.get_task(int(task_id))
-            await poller._process_task(full)
-            return {"status": "ok", "task_id": task_id}
+            full = pf.get(
+                f"/task/{int(task_id)}",
+                params={"fields": "id,name,description,status,owner,assignees,participants,startDateTime,endDateTime,object,template"},
+            )
+            full_task = full.get("task", full)
+            await poller._process_task(full_task, force=True)
+            return {"status": "ok", "task_id": task_id, "mode": "instant"}
         except Exception as e:
             logger.exception(f"Webhook processing error: {e}")
             return {"status": "error", "detail": str(e)}
