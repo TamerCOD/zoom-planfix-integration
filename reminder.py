@@ -149,14 +149,15 @@ class ReminderManager:
             )
             self.tg.send_message_safe(tg_text, disable_web_page_preview=True)
 
-        # ─── Комментарий в PlanFix (тегирует всех участников через @упоминания) ─
+        # ─── Комментарий в PlanFix (HTML формат — \n не работает) ─────────────
         try:
             comment = (
-                f"⏰ **Напоминание — {short}**\n\n"
-                f"📌 Тема: {topic}\n"
-                f"🕐 Начало: {time_str}\n\n"
-                f"🔗 {join_url}\n"
-                f"🔑 Meeting ID: `{meeting_id}` | 🔐 Пароль: `{password}`"
+                f'<b>⏰ Напоминание — {short}</b><br><br>'
+                f'📌 <b>Тема:</b> {topic}<br>'
+                f'🕐 <b>Начало:</b> {time_str}<br><br>'
+                f'🔗 <a href="{join_url}">{join_url}</a><br>'
+                f'🔑 <b>Meeting ID:</b> {meeting_id}<br>'
+                f'🔐 <b>Пароль:</b> {password}'
             )
             self.pf.add_comment(task_id, comment)
         except Exception as e:
