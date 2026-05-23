@@ -220,6 +220,9 @@ class ZoomPoller:
         self._stop = False
         # Локи per-task_id для защиты от race condition (webhook + polling)
         self._task_locks: dict = {}
+        # ⛔ Гарантированный кэш: если уже создали встречу для task_id — больше НИКОГДА не создаём
+        # {task_id: meeting_id}
+        self._created_meetings: dict = {}
         # Менеджер напоминаний
         self.reminders = ReminderManager(pf, tg, cfg)
 
@@ -443,6 +446,23 @@ class ZoomPoller:
 
         meta = extract_meta(task.get("description") or "")
 
+        # ⛔ ГАРАНТИРОВАННАЯ защита от повторного создания:
+        # если встреча уже создавалась в этой сессии — никогда не создаём заново
+        if task_id in self._created_meetings and not (meta and meta.get("meeting_id")):
+            # Кэш говорит что мы создавали, но meta не нашли — это race condition с PlanFix
+            # Восстанавливаем meta из кэша или вообще пропускаем
+            logger.warning(
+                f"Task {task_id}: meeting_id={self._created_meetings[task_id]} в кэше, "
+                f"но meta не найдено в description — пропускаю чтобы избежать дубликата"
+            )
+            return
+
+        logger.info(
+            f"Task {task_id}: meta={'YES' if meta else 'NO'} "
+            f"meeting_id={meta.get('meeting_id') if meta else None} "
+            f"cache={self._created_meetings.get(task_id)}"
+        )
+
         # ─── Авторизованная отмена через комментарий /cancel ────────────────
         if meta and meta.get("meeting_id"):
             cancel_result = await self._check_authorized_cancel(task, meta)
@@ -470,6 +490,8 @@ class ZoomPoller:
 
         # ─── Уже создана — проверяем, надо ли обновить ────────────────────────
         if meta and meta.get("meeting_id"):
+            # Запоминаем в кэше на случай если описание потеряется
+            self._created_meetings[task_id] = meta["meeting_id"]
             await self._maybe_update_meeting(task, meta)
             await self._sync_rsvp_subtasks(task)
             return
@@ -651,6 +673,10 @@ class ZoomPoller:
         join_url = meeting["join_url"]
         password = meeting.get("password", "")
         uuid = meeting.get("uuid", "")
+
+        # ⛔ Сразу запоминаем в кэше — даже если запись описания упадёт,
+        # следующий tick не создаст дубликат
+        self._created_meetings[task_id] = meeting_id
 
         # Сохраняем метаданные в описании (включая инициатора для access control)
         meta = {
