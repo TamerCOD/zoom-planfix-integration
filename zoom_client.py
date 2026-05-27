@@ -138,7 +138,7 @@ class ZoomClient:
         """
         body = {
             "topic": topic,
-            "type": 2,                    # 2 = Scheduled meeting
+            "type": 2,                       # 2 = Scheduled meeting
             "start_time": start_time_iso,
             "duration": duration_min,
             "timezone": timezone,
@@ -146,12 +146,19 @@ class ZoomClient:
             "settings": {
                 "host_video": True,
                 "participant_video": True,
-                "join_before_host": False,
-                "waiting_room": True,      # Зал ожидания — безопаснее
+                "join_before_host": True,    # ✅ Участники заходят БЕЗ ожидания хоста
+                "jbh_time": 0,               # ✅ Можно заходить в любое время (0 = always)
+                "waiting_room": False,       # ✅ ОТКЛЮЧАЕМ зал ожидания
                 "mute_upon_entry": True,
                 "auto_recording": "none",
-                "meeting_authentication": False,
+                "meeting_authentication": False,  # ✅ Не требуем аутентификации
+                "approval_type": 2,          # ✅ 2 = регистрация не требуется
+                "registration_type": 1,      # 1 = регистрация одноразовая (если включится)
                 "allow_multiple_devices": True,
+                "use_pmi": False,
+                "audio": "both",             # Можно подключаться и по телефону, и по интернету
+                "enforce_login": False,
+                "host_save_video_order": False,
             },
         }
 

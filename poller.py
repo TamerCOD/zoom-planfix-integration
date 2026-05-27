@@ -765,29 +765,37 @@ class ZoomPoller:
         except Exception as e:
             logger.warning(f"Не удалось обновить task {task_id}: {e}")
 
-        # ── Шаг 4: комментарий в PlanFix со ссылкой (HTML — PlanFix вырезает \n) ─
+        # ── Шаг 4: красиво структурированный комментарий в PlanFix ──────────
+        # Используем <p>, <ul>, <li>, <hr>, <strong> для нативного рендера PlanFix
+        # PlanFix вырезает \n но сохраняет HTML
+        participants_list_html = "".join(
+            f"<li>{name}</li>" for name in participant_names
+        )
         comment = (
-            f'<b>🎥 Zoom-конференция создана автоматически</b>'
-            f'<br><br>'
-            f'📌 <b>Тема:</b> {topic}<br>'
-            f'🕐 <b>Время:</b> {time_str}<br>'
-            f'⏱ <b>Длительность:</b> {duration} мин<br>'
-            f'👤 <b>Инициатор:</b> {initiator_name}<br>'
-            f'👥 <b>Участники:</b> {participants_text}'
-            f'<br><br>━━━━━━━━━━━━━━━━━━━━━━<br>'
-            f'🔗 <b>Ссылка для подключения:</b><br>'
-            f'<a href="{join_url}">{join_url}</a>'
-            f'<br><br>'
-            f'🔑 <b>Meeting ID:</b> {meeting_id}<br>'
-            f'🔐 <b>Пароль:</b> {password}'
-            f'<br>━━━━━━━━━━━━━━━━━━━━━━<br><br>'
-            f'<b>❗ Отмена встречи</b><br>'
-            f'Только инициатор ({initiator_name}) может отменить. Для отмены — '
-            f'напишите в комментарии: <b>/cancel</b>'
-            f'<br><br>'
-            f'<b>📋 Подтверждение участия (RSVP)</b><br>'
-            f'Для каждого участника создана подзадача ниже. Каждый видит только свою — '
-            f'меняет статус: «В работе» = БУДУ, «Отказ»/«Отмененная» = НЕ БУДУ.'
+            f'<p><b>🎥 Zoom-конференция создана</b></p>'
+            f'<p>'
+            f'<b>📌 Тема:</b> {topic}<br>'
+            f'<b>🕐 Дата и время:</b> {time_str}<br>'
+            f'<b>⏱ Длительность:</b> {duration} мин<br>'
+            f'<b>👤 Инициатор:</b> {initiator_name}'
+            f'</p>'
+            f'<p><b>👥 Участники ({len(participant_names)}):</b></p>'
+            f'<ul>{participants_list_html}</ul>'
+            f'<hr>'
+            f'<p><b>🔗 Подключение</b></p>'
+            f'<p>'
+            f'<b>Ссылка:</b> <a href="{join_url}" target="_blank">{join_url}</a><br>'
+            f'<b>Meeting ID:</b> <code>{meeting_id}</code><br>'
+            f'<b>Пароль:</b> <code>{password}</code>'
+            f'</p>'
+            f'<hr>'
+            f'<p><b>📋 Подтверждение участия (RSVP)</b></p>'
+            f'<p>Каждому участнику создана подзадача. Участник нажимает свою кнопку '
+            f'<b>«Буду»</b> или <b>«Не буду»</b> — это видят все.</p>'
+            f'<hr>'
+            f'<p><b>❌ Как отменить встречу</b></p>'
+            f'<p>Напишите в этой задаче комментарий <code>/cancel</code> '
+            f'(только инициатор может отменить).</p>'
         )
         try:
             self.pf.add_comment(task_id, comment)
@@ -938,15 +946,33 @@ class ZoomPoller:
 
         for st in rsvp_subtasks:
             sid = st["id"]
-            new_status_id = (st.get("status") or {}).get("id")
+            status_info = st.get("status") or {}
+            new_status_id = status_info.get("id")
+            status_name_lower = (status_info.get("name") or "").lower()
             if not new_status_id:
                 continue
 
             old_status_id = self._rsvp_status_cache.get(sid)
 
-            # При первом обнаружении — просто запоминаем
+            # Проверка: статус УЖЕ означает «дал ответ» (даже если не было изменения за сессию)
+            is_responded_status = (
+                new_status_id in (3, 6)  # Завершенная, Выполненная
+                or any(kw in status_name_lower for kw in
+                       ["буду", "не буду", "приму", "откаж", "отказ", "соглас", "приня"])
+            )
+
+            # При первом обнаружении:
+            #  - если статус «ответ дан» → обработать (на случай если ответ был до старта сервера)
+            #  - иначе → просто запомнить
             if old_status_id is None:
                 self._rsvp_status_cache[sid] = new_status_id
+                if is_responded_status:
+                    # Проверяем что в подзадаче ЕЩЁ НЕТ нашего бот-комментария
+                    if not await self._rsvp_already_processed(sid):
+                        try:
+                            await self._handle_rsvp_status_change(st, new_status_id)
+                        except Exception as e:
+                            logger.exception(f"Ошибка обработки RSVP {sid}: {e}")
                 continue
 
             # Статус не изменился — пропускаем
@@ -959,6 +985,24 @@ class ZoomPoller:
                 await self._handle_rsvp_status_change(st, new_status_id)
             except Exception as e:
                 logger.exception(f"Ошибка обработки изменения RSVP {sid}: {e}")
+
+    async def _rsvp_already_processed(self, subtask_id: int) -> bool:
+        """
+        Проверить, оставлял ли уже бот комментарий "Ответ принят" в подзадаче.
+        Защита от дубликатов после рестарта сервера.
+        """
+        try:
+            res = self.pf.post(
+                f"/task/{subtask_id}/comments/list",
+                {"offset": 0, "pageSize": 10, "fields": "id,description"},
+            )
+            for c in res.get("comments", []):
+                text = (c.get("description") or "").lower()
+                if "ваш ответ принят" in text:
+                    return True
+        except Exception:
+            pass
+        return False
 
     async def _handle_rsvp_status_change(self, subtask: dict, new_status_id: int):
         """
@@ -980,16 +1024,30 @@ class ZoomPoller:
 
         # Получаем имя статуса для отображения
         status_info = subtask.get("status") or {}
-        status_name = status_info.get("name", f"id={new_status_id}")
+        status_name = (status_info.get("name") or "").strip()
+        status_name_lower = status_name.lower()
 
-        # Определяем — Буду или Не буду
-        # Закрытые статусы: 3 (Завершенная), 6 (Выполненная), и пользовательские «Отказ»
+        logger.info(
+            f"RSVP {sid} ({participant_name}): статус изменился на "
+            f"'{status_name}' (id={new_status_id})"
+        )
+
+        # Определяем — Буду или Не буду по имени статуса (надёжнее чем ID)
         is_attending = None
-        positive_statuses = {2, 3, 6}  # В работе, Завершенная, Выполненная
-        if new_status_id in positive_statuses:
-            is_attending = True
-        elif "отказ" in status_name.lower() or "не буду" in status_name.lower():
+
+        # Позитивные ключевые слова в имени статуса
+        positive_keywords = ["буду", "приму", "приду", "соглас", "приня", "yes", "да"]
+        # Негативные ключевые слова
+        negative_keywords = ["не буду", "не приду", "откаж", "отказ", "no", "нет"]
+
+        # Сначала проверяем НЕГАТИВ (более специфичный — "не буду" содержит "буду")
+        if any(kw in status_name_lower for kw in negative_keywords):
             is_attending = False
+        elif any(kw in status_name_lower for kw in positive_keywords):
+            is_attending = True
+        # Fallback: стандартные ID статусов PlanFix
+        elif new_status_id in (2, 3, 6):  # В работе, Завершенная, Выполненная
+            is_attending = True
         else:
             # Неизвестный статус — не реагируем
             logger.info(f"RSVP {sid}: статус '{status_name}' — нейтральный, не комментирую")
@@ -998,25 +1056,35 @@ class ZoomPoller:
         # ── Комментарий в подзадаче ──────────────────────────────────────────
         if is_attending:
             subtask_comment = (
-                f'<b>✅ Ответ принят</b><br><br>'
-                f'Вы подтвердили участие в Zoom-конференции.<br>'
-                f'Ссылка на встречу — в комментариях родительской задачи.'
+                f'<p><b>✅ Ваш ответ принят</b></p>'
+                f'<p>Вы подтвердили участие в Zoom-конференции.</p>'
+                f'<p>Ссылка для подключения, Meeting ID и пароль — '
+                f'в комментариях <b>родительской задачи</b>.</p>'
+                f'<p><i>Если планы изменятся — вы можете переоткрыть эту подзадачу '
+                f'и изменить ответ на «Не буду».</i></p>'
             )
             parent_comment = (
-                f'<b>✅ {participant_name} подтвердил(а) участие</b><br><br>'
-                f'Статус подзадачи: {status_name}'
+                f'<p><b>✅ {participant_name} — БУДУ</b></p>'
+                f'<p>Участник подтвердил участие в Zoom-конференции.</p>'
             )
-            tg_msg = f"✅ *{participant_name}* подтвердил(а) участие в Zoom-встрече"
+            tg_msg = (
+                f"✅ *{participant_name}* подтвердил(а) участие\n"
+                f"в Zoom-встрече"
+            )
         else:
             subtask_comment = (
-                f'<b>🚫 Ответ принят</b><br><br>'
-                f'Вы отказались от участия в Zoom-конференции.'
+                f'<p><b>🚫 Ваш ответ принят</b></p>'
+                f'<p>Вы отказались от участия в Zoom-конференции.</p>'
+                f'<p><i>Если передумаете — переоткройте задачу и измените статус.</i></p>'
             )
             parent_comment = (
-                f'<b>🚫 {participant_name} отказался(ась) от участия</b><br><br>'
-                f'Статус подзадачи: {status_name}'
+                f'<p><b>🚫 {participant_name} — НЕ БУДУ</b></p>'
+                f'<p>Участник отказался от участия в Zoom-конференции.</p>'
             )
-            tg_msg = f"🚫 *{participant_name}* отказался(ась) от Zoom-встречи"
+            tg_msg = (
+                f"🚫 *{participant_name}* отказался(ась)\n"
+                f"от Zoom-встречи"
+            )
 
         # 1) Комментарий в подзадаче
         try:
